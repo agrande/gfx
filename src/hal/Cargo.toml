@@ -25,6 +25,7 @@ naga = { git = "https://github.com/gfx-rs/naga", tag = "gfx-4" }
 raw-window-handle = "0.3"
 serde = { version = "1", features = ["serde_derive"], optional = true }
 thiserror = "1"
+openxr = "0.13.1"
 
 [dev-dependencies]
 gfx-backend-empty = { path = "../backend/empty", version = "0.6" }

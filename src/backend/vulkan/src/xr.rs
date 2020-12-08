@@ -1,15 +1,18 @@
 use hal::adapter::PhysicalDevice;
-use hal::{Backend, Instance};
+use hal::Instance;
+
+use ash::version::InstanceV1_0;
+use ash::vk::Handle;
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-trait XrCreateInstance<B: Backend>: Sized {
-    fn create(&self, name: &str, version: u32) -> Result<XrInstance, hal::UnsupportedBackend>;
-}
-
-impl XrCreateInstance<super::Backend> for super::Instance {
-    fn create(&self, name: &str, version: u32) -> Result<XrInstance, hal::UnsupportedBackend> {
+impl super::Instance {
+    pub fn create_xr_instance(
+        &self,
+        name: &str,
+        version: u32,
+    ) -> Result<XrInstance, hal::UnsupportedBackend> {
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Missing OpenXR entry points: {:?}", e);
             hal::UnsupportedBackend
@@ -63,12 +66,12 @@ pub struct XrInstance {
     xr_raw: Arc<openxr::Instance>,
 }
 
-impl XrInstance {
+impl hal::xr::XrInstance<Backend, super::Backend> for XrInstance {
     fn create_system(
         &self,
         form_factor: openxr::FormFactor,
         view_type: openxr::ViewConfigurationType,
-    ) -> Result<XrSystemInstance, hal::UnsupportedBackend> {
+    ) -> Result<XrSystem, hal::UnsupportedBackend> {
         let system = self.xr_raw.system(form_factor).map_err(|e| {
             warn!("Failed to create OpenXR system: {:?}", e);
             hal::UnsupportedBackend
@@ -101,21 +104,44 @@ impl XrInstance {
             }
         }
 
-        Ok(XrSystemInstance {
+        Ok(XrSystem {
             xr_raw: self.xr_raw.clone(),
             system,
         })
     }
 }
 
-trait XrSystem<B: Backend>: Sized {
-    fn requirements(&self) -> openxr::Result<openxr::vulkan::Requirements>;
-}
-
-impl XrSystem<super::Backend> for XrSystemInstance {
+impl hal::xr::XrSystem<Backend, super::Backend> for XrSystem {
     fn requirements(&self) -> openxr::Result<openxr::vulkan::Requirements> {
         self.xr_raw
             .graphics_requirements::<openxr::Vulkan>(self.system)
+    }
+
+    fn create_session(
+        &self,
+        instance: super::Instance,
+        physical_device: super::PhysicalDevice,
+        device: super::Device,
+    ) -> XrSession {
+        let session_info = openxr::vulkan::SessionCreateInfo {
+            instance: instance.raw.inner.handle().as_raw() as _,
+            physical_device: physical_device.handle.as_raw() as _,
+            device: device.shared.raw.handle().as_raw() as _,
+            queue_family_index: 0,
+            queue_index: 0,
+        };
+
+        let (session, frame_wait, frame_stream) = unsafe {
+            self.xr_raw
+                .create_session::<openxr::Vulkan>(self.system, &session_info)
+                .unwrap()
+        };
+
+        XrSession {
+            session,
+            frame_stream,
+            frame_wait,
+        }
     }
 }
 
@@ -124,7 +150,24 @@ pub struct XrRequirements {
     pub max_api_version_supported: openxr::Version,
 }
 
-pub struct XrSystemInstance {
+pub struct XrSystem {
     xr_raw: Arc<openxr::Instance>,
     system: openxr::SystemId,
+}
+
+pub struct XrSession {
+    session: openxr::Session<openxr::Vulkan>,
+    frame_wait: openxr::FrameWaiter,
+    frame_stream: openxr::FrameStream<openxr::Vulkan>,
+}
+
+impl hal::xr::XrSession<Backend> for XrSession {}
+
+pub enum Backend {}
+
+impl hal::xr::XrBackend for Backend {
+    type Backend = super::Backend;
+    type Instance = XrInstance;
+    type System = XrSystem;
+    type Session = XrSession;
 }
