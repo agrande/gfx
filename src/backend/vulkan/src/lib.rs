@@ -52,6 +52,7 @@ mod info;
 mod native;
 mod pool;
 mod window;
+mod xr;
 
 // CStr's cannot be constant yet, until const fn lands we need to use a lazy_static
 lazy_static! {

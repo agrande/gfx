@@ -30,6 +30,7 @@ hal = { path = "../../hal", version = "0.6", package = "gfx-hal" }
 smallvec = "1.0"
 raw-window-handle = "0.3"
 inplace_it = "0.3.2"
+openxr = "0.13.1"
 
 [dependencies.naga]
 git = "https://github.com/gfx-rs/naga"
