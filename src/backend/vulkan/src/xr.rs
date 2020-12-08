@@ -109,6 +109,13 @@ impl hal::xr::XrInstance<Backend, super::Backend> for XrInstance {
             system,
         })
     }
+
+    fn poll_event<'buffer>(
+        &self,
+        event_storage: &'buffer mut openxr::EventDataBuffer,
+    ) -> openxr::Result<Option<openxr::Event<'buffer>>> {
+        self.xr_raw.poll_event(event_storage)
+    }
 }
 
 impl hal::xr::XrSystem<Backend, super::Backend> for XrSystem {
@@ -161,13 +168,29 @@ pub struct XrSession {
     frame_stream: openxr::FrameStream<openxr::Vulkan>,
 }
 
-impl hal::xr::XrSession<Backend> for XrSession {}
+impl hal::xr::XrSession<Backend> for XrSession {
+    fn create_reference_space(
+        &self,
+        ty: openxr::ReferenceSpaceType,
+        pose: openxr::Posef,
+    ) -> Result<XrSpace, openxr::sys::Result> {
+        let space = self.session.create_reference_space(ty, pose)?;
+
+        Ok(XrSpace { space })
+    }
+}
+
+pub struct XrSpace {
+    space: openxr::Space,
+}
+
+impl hal::xr::XrSpace<Backend> for XrSpace {}
 
 pub enum Backend {}
-
 impl hal::xr::XrBackend for Backend {
     type Backend = super::Backend;
     type Instance = XrInstance;
     type System = XrSystem;
     type Session = XrSession;
+    type Space = XrSpace;
 }
