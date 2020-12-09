@@ -150,6 +150,14 @@ impl hal::xr::XrSystem<Backend, super::Backend> for XrSystem {
             frame_wait,
         }
     }
+
+    fn enumerate_view_configuration_views(
+        &self,
+        ty: openxr::ViewConfigurationType,
+    ) -> openxr::Result<Vec<openxr::ViewConfigurationView>> {
+        self.xr_raw
+            .enumerate_view_configuration_views(self.system, ty)
+    }
 }
 
 pub struct XrRequirements {
@@ -164,7 +172,7 @@ pub struct XrSystem {
 
 pub struct XrSession {
     session: openxr::Session<openxr::Vulkan>,
-    frame_wait: openxr::FrameWaiter,
+    pub frame_wait: openxr::FrameWaiter,
     frame_stream: openxr::FrameStream<openxr::Vulkan>,
 }
 
@@ -178,6 +186,41 @@ impl hal::xr::XrSession<Backend> for XrSession {
 
         Ok(XrSpace { space })
     }
+
+    fn begin_frame_stream(&mut self) {
+        self.frame_stream.begin().unwrap()
+    }
+
+    fn end_frame_stream(
+        &mut self,
+        layers: &[&openxr::CompositionLayerBase<'_, openxr::Vulkan>],
+        frame_state: openxr::FrameState,
+    ) {
+        self.frame_stream
+            .end(
+                frame_state.predicted_display_time,
+                openxr::EnvironmentBlendMode::ALPHA_BLEND,
+                layers,
+            )
+            .unwrap()
+    }
+
+    fn create_swapchain(
+        &self,
+        create_info: &openxr::SwapchainCreateInfo<openxr::Vulkan>,
+    ) -> openxr::Result<openxr::Swapchain<openxr::Vulkan>> {
+        self.session.create_swapchain(create_info)
+    }
+
+    fn locate_views(
+        &self,
+        view_configuration_type: openxr::ViewConfigurationType,
+        display_time: openxr::Time,
+        space: XrSpace,
+    ) -> openxr::Result<(openxr::ViewStateFlags, Vec<openxr::View>)> {
+        self.session
+            .locate_views(view_configuration_type, display_time, &space.space)
+    }
 }
 
 pub struct XrSpace {
@@ -185,6 +228,47 @@ pub struct XrSpace {
 }
 
 impl hal::xr::XrSpace<Backend> for XrSpace {}
+
+pub struct XrSwapchain {
+    swapchain: openxr::Swapchain<openxr::Vulkan>,
+}
+
+impl hal::xr::XrSwapchain<Backend, super::Backend> for XrSwapchain {
+    fn enumerate_images(&self) -> Vec<super::native::Image> {
+        self.swapchain
+            .enumerate_images()
+            .unwrap()
+            .iter()
+            .map(|image| {
+                let image_handle = ash::vk::Image::from_raw(*image);
+                let image_type = ash::vk::ImageType::from_raw(2);
+                let image_flags = ash::vk::ImageCreateFlags::empty();
+
+                super::native::Image {
+                    raw: image_handle,
+                    ty: image_type,
+                    flags: image_flags,
+                    // TODO
+                    extent: ash::vk::Extent3D::builder()
+                        .width(1)
+                        .height(0)
+                        .depth(0)
+                        .build(),
+                }
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn acquire_image(&mut self) -> u32 {
+        self.swapchain.acquire_image().unwrap()
+    }
+
+    fn wait_image(&mut self, timeout: i64) {
+        self.swapchain
+            .wait_image(openxr::Duration::from_nanos(timeout))
+            .unwrap()
+    }
+}
 
 pub enum Backend {}
 impl hal::xr::XrBackend for Backend {
