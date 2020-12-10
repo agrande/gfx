@@ -13,7 +13,7 @@ impl super::Instance {
         name: &str,
         version: u32,
     ) -> Result<XrInstance, hal::UnsupportedBackend> {
-        let entry = openxr::Entry::load().map_err(|e| {
+        let entry = openxr::Entry::linked().map_err(|e| {
             info!("Missing OpenXR entry points: {:?}", e);
             hal::UnsupportedBackend
         })?;
@@ -67,6 +67,53 @@ pub struct XrInstance {
 }
 
 impl hal::xr::XrInstance<Backend, super::Backend> for XrInstance {
+    fn create(gfx_instance: &super::Instance, name: &str, version: u32) -> Result<XrInstance, hal::UnsupportedBackend> {
+        let entry = openxr::Entry::load().map_err(|e| {
+            info!("Missing OpenXR entry points: {:?}", e);
+            hal::UnsupportedBackend
+        })?;
+
+        let app_info = openxr::ApplicationInfo {
+            application_name: name,
+            application_version: version,
+            engine_name: "gfx-rs",
+            engine_version: 1,
+        };
+
+        let instance_extensions = entry.enumerate_extensions().map_err(|e| {
+            info!("Unable to enumerate instance extensions: {:?}", e);
+            hal::UnsupportedBackend
+        })?;
+
+        let instance_layers = entry.enumerate_layers().map_err(|e| {
+            info!("Unable to enumerate instance layers: {:?}", e);
+            hal::UnsupportedBackend
+        })?;
+
+        let instance = entry
+            .create_instance(&app_info, &instance_extensions, &[])
+            .map_err(|e| {
+                info!("Failed to create OpenXR instance: {:?}", e);
+                hal::UnsupportedBackend
+            })?;
+
+        if let Ok(properties) = instance.properties() {
+            debug!(
+                "Loaded OpenXR runtime: {} {}",
+                properties.runtime_name, properties.runtime_version
+            )
+        } else {
+            warn!("Unable to get OpenXR instance properties")
+        }
+
+        Ok(XrInstance {
+            vk_raw: gfx_instance.raw.clone(),
+            // TODO
+            vk_instance_exts: gfx_instance.extensions.clone(),
+            xr_raw: Arc::new(instance),
+        })
+    }
+
     fn create_system(
         &self,
         form_factor: openxr::FormFactor,
