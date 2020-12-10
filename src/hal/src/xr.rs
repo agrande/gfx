@@ -17,7 +17,11 @@ pub trait XrBackend: Sized {
 /// TODO
 pub trait XrInstance<X: XrBackend, B: super::Backend> {
     /// TODO
-    fn create(instance: &B::Instance, name: &str, version: u32) -> Result<X::Instance, super::UnsupportedBackend>;
+    fn create(
+        instance: &B::Instance,
+        name: &str,
+        version: u32,
+    ) -> Result<X::Instance, super::UnsupportedBackend>;
     /// TODO
     fn create_system(
         &self,

@@ -34,7 +34,7 @@ inplace_it = "0.3.2"
 
 [dependencies.openxr]
 version = "0.13.1"
-features = ["static"]
+# features = ["static"]
 
 [dependencies.naga]
 git = "https://github.com/gfx-rs/naga"

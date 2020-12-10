@@ -13,7 +13,7 @@ impl super::Instance {
         name: &str,
         version: u32,
     ) -> Result<XrInstance, hal::UnsupportedBackend> {
-        let entry = openxr::Entry::linked().map_err(|e| {
+        let entry = openxr::Entry::load().map_err(|e| {
             info!("Missing OpenXR entry points: {:?}", e);
             hal::UnsupportedBackend
         })?;
@@ -67,7 +67,11 @@ pub struct XrInstance {
 }
 
 impl hal::xr::XrInstance<Backend, super::Backend> for XrInstance {
-    fn create(gfx_instance: &super::Instance, name: &str, version: u32) -> Result<XrInstance, hal::UnsupportedBackend> {
+    fn create(
+        gfx_instance: &super::Instance,
+        name: &str,
+        version: u32,
+    ) -> Result<XrInstance, hal::UnsupportedBackend> {
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Missing OpenXR entry points: {:?}", e);
             hal::UnsupportedBackend
