@@ -311,6 +311,7 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
 
             // SAFETY: The parameters passed to `create_instance` are as OpenXR expects them.
             // See above safety proofs for validation.
+            //
             // References:
             // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrCreateInstance
             let call_result =
