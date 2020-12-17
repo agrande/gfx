@@ -54,7 +54,7 @@ mod pool;
 mod window;
 mod xr;
 
-pub use xr::{XrInstance, XrRequirements, XrSession, XrSpace, XrSwapchain, XrSystem};
+pub use xr::Backend as XrBackend;
 
 // CStr's cannot be constant yet, until const fn lands we need to use a lazy_static
 lazy_static! {

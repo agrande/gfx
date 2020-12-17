@@ -10,9 +10,11 @@ mod graphics;
 mod input_assembler;
 mod output_merger;
 mod specialization;
+mod xr;
 
 pub use self::{
-    compute::*, descriptor::*, graphics::*, input_assembler::*, output_merger::*, specialization::*,
+    compute::*, descriptor::*, graphics::*, input_assembler::*, output_merger::*,
+    specialization::*, xr::*,
 };
 
 /// Error types happening upon PSO creation on the device side.

@@ -30,10 +30,15 @@ hal = { path = "../../hal", version = "0.6", package = "gfx-hal" }
 smallvec = "1.0"
 raw-window-handle = "0.3"
 inplace_it = "0.3.2"
+libloading = "0.6.6"
 
+[dependencies.openxr-sys]
+version = "0.8.5"
 
+# This is temporarily for `Entry`
 [dependencies.openxr]
 version = "0.13.1"
+
 # features = ["static"]
 
 [dependencies.naga]

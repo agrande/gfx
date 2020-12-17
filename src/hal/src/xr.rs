@@ -1,97 +1,71 @@
 //! Contains traits and types for gfx-hal's XR support
+/// TODO
+pub trait XrBackend {
+    /// TODO
+    type Instance;
 
-/// The standard interface for an XR Backend
-pub trait XrBackend: Sized {
-    /// The graphics backend used with this XrBackend
-    type Backend: super::Backend;
     /// TODO
-    type Instance: XrInstance<Self, Self::Backend>;
+    fn enumerate_extension_properties(
+    ) -> Result<Vec<super::pso::ExtensionProperty>, super::UnsupportedBackend>;
     /// TODO
-    type System: XrSystem<Self, Self::Backend>;
-    /// TODO
-    type Session: XrSession<Self>;
-    /// TODO
-    type Space: XrSpace<Self>;
+    #[doc(alias = "xrEnumerateApiLayerProperties")]
+    fn enumerate_layers() -> Result<Vec<super::pso::ApiLayerProperties>, super::UnsupportedBackend>;
 }
 
-/// TODO
-pub trait XrInstance<X: XrBackend, B: super::Backend> {
-    /// TODO
-    fn create(
-        instance: &B::Instance,
-        name: &str,
-        version: u32,
+/// Extends a [`super::Backend`]'s functionality to allow for XR configuration and state querying.
+pub trait InstanceExtXr<X: XrBackend>: Sized {
+    /// Creates an OpenXR instance.
+    ///
+    /// Creates an OpenXR instance with the given application name and version. Optionally specifies
+    /// an engine name and engine version.
+    /// The OpenXR specification comments on the purpose and use of `engine_name` and `engine_version`:
+    /// > When implementing a reusable engine that will be used by many applications,
+    /// `engine_name` **should** be set to a unique string that identifies the engine,
+    /// and `engine_version` **should** encode a representation of the engine's version.
+    /// This way, all applications that share this engine version will provide the same
+    /// `engine_name` and `engine_version` to the runtime. The engine **should** then enable
+    /// individual applications to choose their specific `application_name` and
+    /// `application_version`, enabling one application to be distinguished from another
+    /// application.
+    ///
+    /// # Panics
+    /// * If `engine_name` or `application_name` exceeds their maximum size respectively.
+    /// * If `application_name` is empty.
+    ///
+    /// # Examples
+    /// This example demonstrates usage of OpenXR as a one-off program
+    /// where providing an engine name isn't suggested by the specification.
+    /// ```
+    /// let dummy_instance = this_does_nothing();
+    ///
+    /// dummy_instance.create_xr_instance(
+    ///     "ILD_APPLICATION",
+    ///     5,
+    ///     None,
+    ///     None
+    /// );
+    /// ```
+    ///
+    /// This example demostrates usage of the API for a library or engine.
+    /// It is suggested to set a unique engine name and version.
+    /// ```
+    /// let dummy_instance = this_does_nothing();
+    ///
+    /// dummy_instance.create_xr_instance(
+    ///     "ILD_APPLICATION",
+    ///     5,
+    ///     Some("AWESOME_XR_ENGINE"),
+    ///     Some(2)
+    ///);
+    ///```
+    #[doc(alias = "xrCreateInstance")]
+    fn create_xr_instance<S: AsRef<str>>(
+        &self,
+        application_name: S,
+        application_version: u32,
+        engine_name: Option<S>,
+        engine_version: Option<u32>,
+        required_layers: &[&str],
+        required_extensions: &[&str],
     ) -> Result<X::Instance, super::UnsupportedBackend>;
-    /// TODO
-    fn create_system(
-        &self,
-        form_factor: openxr::FormFactor,
-        view_type: openxr::ViewConfigurationType,
-    ) -> Result<X::System, super::UnsupportedBackend>;
-    /// TODO
-    fn poll_event<'buffer>(
-        &self,
-        event_storage: &'buffer mut openxr::EventDataBuffer,
-    ) -> openxr::Result<Option<openxr::Event<'buffer>>>;
-}
-
-/// TODO
-pub trait XrSystem<X: XrBackend, B: super::Backend>: Sized {
-    /// TODO
-    fn requirements(&self) -> openxr::Result<openxr::vulkan::Requirements>;
-    /// TODO
-    fn create_session(
-        &self,
-        instance: B::Instance,
-        physical_device: B::PhysicalDevice,
-        device: B::Device,
-    ) -> X::Session;
-    /// TODO
-    fn enumerate_view_configuration_views(
-        &self,
-        ty: openxr::ViewConfigurationType,
-    ) -> openxr::Result<Vec<openxr::ViewConfigurationView>>;
-}
-
-/// TODO
-pub trait XrSession<X: XrBackend> {
-    /// TODO
-    fn create_reference_space(
-        &self,
-        ty: openxr::ReferenceSpaceType,
-        pose: openxr::Posef,
-    ) -> Result<X::Space, openxr::sys::Result>;
-    /// TODO
-    fn begin_frame_stream(&mut self);
-    /// TODO
-    fn end_frame_stream(
-        &mut self,
-        layers: &[&openxr::CompositionLayerBase<'_, openxr::Vulkan>],
-        frame_state: openxr::FrameState,
-    );
-    /// TODO
-    fn create_swapchain(
-        &self,
-        create_info: &openxr::SwapchainCreateInfo<openxr::Vulkan>,
-    ) -> openxr::Result<openxr::Swapchain<openxr::Vulkan>>;
-    /// owo
-    fn locate_views(
-        &self,
-        view_configuration_type: openxr::ViewConfigurationType,
-        display_time: openxr::Time,
-        space: X::Space,
-    ) -> openxr::Result<(openxr::ViewStateFlags, Vec<openxr::View>)>;
-}
-
-/// TODO
-pub trait XrSpace<X: XrBackend> {}
-
-/// TODO
-pub trait XrSwapchain<X: XrBackend, B: super::Backend> {
-    ///ss
-    fn enumerate_images(&self) -> Vec<B::Image>;
-    /// ss
-    fn acquire_image(&mut self) -> u32;
-    /// ss
-    fn wait_image(&mut self, timeout: i64);
 }
