@@ -1,9 +1,11 @@
 use std::ffi::{CStr, CString};
 
+use std::sync::Arc;
+
 pub enum Backend {}
 
 impl hal::xr::XrBackend for Backend {
-    type Instance = ();
+    type Instance = Instance;
 
     fn enumerate_extension_properties(
     ) -> Result<Vec<hal::pso::ExtensionProperty>, hal::UnsupportedBackend> {
@@ -173,7 +175,7 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
         engine_version: Option<u32>,
         required_layers: &[&str],
         required_extensions: &[&str],
-    ) -> Result<(), hal::UnsupportedBackend> {
+    ) -> Result<Instance, hal::UnsupportedBackend> {
         // TODO: This is still a hack
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Failed to load an OpenXR runtime. {:?}", e);
@@ -302,7 +304,7 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
             enabled_extension_names: required_ext_ptrs.as_ptr(),
         };
 
-        let _instance = {
+        let instance = {
             let mut instance_handle = openxr_sys::Instance::NULL;
 
             // SAFETY: The parameters passed to `create_instance` are as OpenXR expects them.
@@ -315,6 +317,14 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
             instance_handle
         };
 
-        Ok(())
+        Ok(Instance {
+            entry,
+            raw_instance: Arc::new(instance),
+        })
     }
+}
+
+pub struct Instance {
+    entry: openxr::Entry,
+    raw_instance: Arc<openxr_sys::Instance>,
 }
