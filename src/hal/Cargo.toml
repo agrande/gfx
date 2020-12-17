@@ -26,6 +26,7 @@ serde = { version = "1", features = ["serde_derive"], optional = true }
 thiserror = "1"
 openxr = "0.13.1"
 libloading = "0.6.6"
+openxr-sys = "0.8.5"
 
 
 [dev-dependencies]

@@ -6,10 +6,10 @@ pub trait XrBackend {
 
     /// TODO
     fn enumerate_extension_properties(
-    ) -> Result<Vec<super::pso::ExtensionProperty>, super::UnsupportedBackend>;
+    ) -> Result<Vec<super::pso::XrExtensionProperty>, super::UnsupportedBackend>;
     /// TODO
     #[doc(alias = "xrEnumerateApiLayerProperties")]
-    fn enumerate_layers() -> Result<Vec<super::pso::ApiLayerProperties>, super::UnsupportedBackend>;
+    fn enumerate_layers() -> Result<Vec<super::pso::XrApiLayerProperties>, super::UnsupportedBackend>;
 }
 
 /// Extends a [`super::Backend`]'s functionality to allow for XR configuration and state querying.
@@ -67,5 +67,5 @@ pub trait InstanceExtXr<X: XrBackend>: Sized {
         engine_version: Option<u32>,
         required_layers: &[&str],
         required_extensions: &[&str],
-    ) -> Result<X::Instance, super::UnsupportedBackend>;
+    ) -> Result<X::Instance, super::pso::XrInstanceCreationError>;
 }

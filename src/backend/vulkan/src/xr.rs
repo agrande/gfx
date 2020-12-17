@@ -1,5 +1,7 @@
 use std::ffi::{CStr, CString};
 
+use hal::pso::XrInstanceCreationError;
+use openxr_sys::Result as XrResult;
 use std::sync::Arc;
 
 pub enum Backend {}
@@ -8,7 +10,7 @@ impl hal::xr::XrBackend for Backend {
     type Instance = Instance;
 
     fn enumerate_extension_properties(
-    ) -> Result<Vec<hal::pso::ExtensionProperty>, hal::UnsupportedBackend> {
+    ) -> Result<Vec<hal::pso::XrExtensionProperty>, hal::UnsupportedBackend> {
         // TODO: Reconsider this
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Failed to load an OpenXR runtime. {:?}", e);
@@ -71,7 +73,7 @@ impl hal::xr::XrBackend for Backend {
                 // SAFETY: We truncated potentially invalid elements from the `Vec`
                 let property = unsafe { property.assume_init() };
 
-                hal::pso::ExtensionProperty {
+                hal::pso::XrExtensionProperty {
                     name: unsafe {
                         CStr::from_ptr(property.extension_name.as_ptr())
                             .to_string_lossy()
@@ -83,7 +85,7 @@ impl hal::xr::XrBackend for Backend {
             .collect())
     }
 
-    fn enumerate_layers() -> Result<Vec<hal::pso::ApiLayerProperties>, hal::UnsupportedBackend> {
+    fn enumerate_layers() -> Result<Vec<hal::pso::XrApiLayerProperties>, hal::UnsupportedBackend> {
         // TODO: Reconsider this
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Failed to load an OpenXR runtime. {:?}", e);
@@ -145,7 +147,7 @@ impl hal::xr::XrBackend for Backend {
                 // See above where the buffer is truncated.
                 let input = unsafe { input.assume_init() };
 
-                hal::pso::ApiLayerProperties {
+                hal::pso::XrApiLayerProperties {
                     // TODO: Safety docs
                     layer_name: unsafe {
                         CStr::from_ptr(input.layer_name.as_ptr())
@@ -175,11 +177,11 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
         engine_version: Option<u32>,
         required_layers: &[&str],
         required_extensions: &[&str],
-    ) -> Result<Instance, hal::UnsupportedBackend> {
+    ) -> Result<Instance, XrInstanceCreationError> {
         // TODO: This is still a hack
         let entry = openxr::Entry::load().map_err(|e| {
             info!("Failed to load an OpenXR runtime. {:?}", e);
-            hal::UnsupportedBackend
+            XrInstanceCreationError::Unsupported
         })?;
 
         // SAFETY: While creating a struct isn't unsafe, ensuring that it was created
@@ -314,17 +316,36 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
             let call_result =
                 unsafe { (entry.fp().create_instance)(&create_info, &mut instance_handle) };
 
+            match call_result {
+                XrResult::SUCCESS => Ok(()),
+                _ => Err(XrInstanceCreationError::InternalError(call_result)),
+            }?;
+
             instance_handle
         };
 
         Ok(Instance {
-            entry,
-            raw_instance: Arc::new(instance),
+            // TODO: SAFETY DOCS
+            raw: unsafe {
+                openxr::raw::Instance::load(&entry, instance).map_err(|e| {
+                    info!("Error while getting instance function pointers: {:?}", e);
+                    XrInstanceCreationError::Unsupported
+                })?
+            },
+            instance,
         })
     }
 }
 
 pub struct Instance {
-    entry: openxr::Entry,
-    raw_instance: Arc<openxr_sys::Instance>,
+    instance: openxr_sys::Instance,
+    raw: openxr::raw::Instance,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let destroy_instance = self.raw.destroy_instance;
+
+        unsafe { destroy_instance(self.instance) };
+    }
 }
