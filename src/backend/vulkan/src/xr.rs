@@ -2,12 +2,15 @@ use std::ffi::{CStr, CString};
 
 use hal::pso::XrInstanceCreationError;
 use openxr_sys::Result as XrResult;
+use std::convert::TryInto;
 use std::sync::Arc;
 
+use libloading::Library;
 pub enum Backend {}
 
 impl hal::xr::XrBackend for Backend {
     type Instance = Instance;
+    type System = XrSystem;
 
     fn enumerate_extension_properties(
     ) -> Result<Vec<hal::pso::XrExtensionProperty>, hal::UnsupportedBackend> {
@@ -328,25 +331,144 @@ impl hal::xr::InstanceExtXr<Backend> for super::Instance {
         Ok(Instance {
             // TODO: SAFETY DOCS
             raw: unsafe {
-                openxr::raw::Instance::load(&entry, instance).map_err(|e| {
+                Arc::new(openxr::raw::Instance::load(&entry, instance).map_err(|e| {
                     info!("Error while getting instance function pointers: {:?}", e);
                     XrInstanceCreationError::Unsupported
-                })?
+                })?)
             },
-            instance,
+            entry: Arc::new(entry),
+            instance: Arc::new(instance),
         })
     }
 }
 
 pub struct Instance {
-    instance: openxr_sys::Instance,
-    raw: openxr::raw::Instance,
+    entry: Arc<openxr::Entry>,
+    instance: Arc<openxr_sys::Instance>,
+    raw: Arc<openxr::raw::Instance>,
+}
+
+impl hal::xr::XrInstance<Backend> for Instance {
+    fn get_system(&self, form_factor: hal::pso::XrFormFactor) -> XrSystem {
+        // SAFETY: This struct is valid as defined by the OpenXR specification.
+        // `ty` is the correct structure type for `XrSystemGetInfo`
+        // `next` is a null pointer, which is valid because we are not
+        // forming a structure chain.
+        // `form_factor` is a valid `XrFormFactor` due to validation using the
+        // `pso::XrFormFactor` enum.
+        //
+        // References:
+        // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#XrSystemGetInfo
+        // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#XrFormFactor
+        let system_get_info = openxr_sys::SystemGetInfo {
+            ty: openxr_sys::SystemGetInfo::TYPE,
+            next: std::ptr::null_mut(),
+            form_factor: openxr_sys::FormFactor::from_raw(form_factor as _),
+        };
+
+        let system_id = {
+            let mut system_id = openxr_sys::SystemId::NULL;
+
+            // SAFETY: The parameters passed to this function are valid as proven
+            // previously and as defined by the OpenXR specification.
+            //
+            // References:
+            // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrGetSystem
+            let result =
+                unsafe { (self.raw.get_system)(*self.instance, &system_get_info, &mut system_id) };
+
+            println!("System result: {:?}. Id: {}", result, system_id.into_raw());
+
+            match result {
+                XrResult::SUCCESS => system_id.into_raw(),
+                // TODO
+                _ => unimplemented!("Error handling needed"),
+            }
+        };
+
+        XrSystem {
+            id: system_id,
+            raw: self.raw.clone(),
+        }
+    }
+
+    fn enumerate_environment_blend_modes(
+        &self,
+        system: &XrSystem,
+        view_configuration: hal::pso::XrViewConfigurationType,
+    ) -> Vec<hal::pso::XrEnvironmentBlendMode> {
+        let enumerate_environment_blend_modes = self.raw.enumerate_environment_blend_modes;
+
+        let required_buffer_size = unsafe {
+            let mut size: u32 = 0;
+
+            // SAFETY: According to the OpenXR documentation, passing 0 as the capacity
+            // and NULL as the pointer to the output buffer will write the required buffer
+            // capacity into the capcity output.
+            //
+            // References:
+            // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrEnumerateEnvironmentBlendModes
+            enumerate_environment_blend_modes(
+                *self.instance,
+                openxr_sys::SystemId::from_raw(system.id),
+                openxr_sys::ViewConfigurationType::from_raw(view_configuration as _),
+                0,
+                &mut size,
+                std::ptr::null_mut(),
+            );
+
+            // TODO: Error checking
+
+            size
+        };
+
+        let blend_modes = unsafe {
+            let mut written_count: u32 = 0;
+
+            let mut result_buffer =
+                vec![openxr_sys::EnvironmentBlendMode::from_raw(0); required_buffer_size as usize];
+
+            // SAFETY: Per the OpenXR specification:
+            // Parameter 1: A valid instance instance from which systemId was retrieved. TODO: We can verify this
+            // Parameter 2: A system ID
+            // Parameter 3: an XrViewConfigurationType
+            // Parameter 4: The size of the input buffer
+            // Parameter 5: A pointer to a `u32` where the amount of blend modes enumerated will be written
+            // Parameter 6: The pointer to the ouput buffer.
+            //
+            // References:
+            // https://www.khronos.org/registry/OpenXR/specs/1.0/html/xrspec.html#xrEnumerateEnvironmentBlendModes
+            enumerate_environment_blend_modes(
+                *self.instance,
+                openxr_sys::SystemId::from_raw(system.id),
+                openxr_sys::ViewConfigurationType::from_raw(view_configuration as _),
+                result_buffer.capacity() as _,
+                &mut written_count,
+                result_buffer.as_mut_ptr() as _,
+            );
+
+            // Truncate the result buffer to the amount of results written.
+            result_buffer.truncate(written_count as _);
+
+            result_buffer
+        };
+
+        blend_modes
+            .iter()
+            .map(|mode| mode.into_raw().try_into().unwrap())
+            .collect()
+    }
+}
+
+pub struct XrSystem {
+    id: u64,
+    raw: Arc<openxr::raw::Instance>,
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         let destroy_instance = self.raw.destroy_instance;
 
-        unsafe { destroy_instance(self.instance) };
+        unsafe { destroy_instance(*self.instance) };
     }
 }

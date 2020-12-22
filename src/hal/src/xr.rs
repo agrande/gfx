@@ -1,8 +1,12 @@
 //! Contains traits and types for gfx-hal's XR support
+
 /// TODO
-pub trait XrBackend {
+pub trait XrBackend: Sized {
     /// TODO
-    type Instance;
+    type Instance: XrInstance<Self>;
+
+    /// TODO
+    type System;
 
     /// TODO
     fn enumerate_extension_properties(
@@ -10,6 +14,31 @@ pub trait XrBackend {
     /// TODO
     #[doc(alias = "xrEnumerateApiLayerProperties")]
     fn enumerate_layers() -> Result<Vec<super::pso::XrApiLayerProperties>, super::UnsupportedBackend>;
+}
+
+/// TODO
+pub trait XrInstance<X: XrBackend>: Sized {
+    /// Returns a System that uses the given form factor.
+    ///
+    /// Returns a System that uses the given form factor. This function's
+    /// error type has variants that indicate temporary errors, this should
+    /// be kept in mind when handling errors returned from this call.
+    ///
+    /// # Panics
+    /// Temporarily panics on any form of error.
+    /// # Examples
+    /// TODO
+    fn get_system(&self, form_factor: super::pso::XrFormFactor) -> X::System;
+    /// Enumerates blend modes supported for the given view configuration.
+    ///
+    /// Enumerated blend modes are typically in the order from highest to
+    /// lowest preference, however the order is determined by the current
+    /// OpenXR runtime.
+    fn enumerate_environment_blend_modes(
+        &self,
+        system: &X::System,
+        view_configuration: super::pso::XrViewConfigurationType,
+    ) -> Vec<super::pso::XrEnvironmentBlendMode>;
 }
 
 /// Extends a [`super::Backend`]'s functionality to allow for XR configuration and state querying.
