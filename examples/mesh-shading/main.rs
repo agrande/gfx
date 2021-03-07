@@ -31,16 +31,8 @@ pub fn wasm_main() {
 }
 
 use hal::{
-    buffer, command, format as f,
-    format::ChannelType,
-    image as i, memory as m, pass,
-    pass::Subpass,
-    pool,
-    prelude::*,
-    pso,
-    pso::ShaderStageFlags,
-    queue::{QueueGroup, Submission},
-    window,
+    buffer, command, format as f, format::ChannelType, image as i, memory as m, pass,
+    pass::Subpass, pool, prelude::*, pso, pso::ShaderStageFlags, queue::QueueGroup, window,
 };
 
 use std::{
@@ -122,7 +114,7 @@ fn main() {
         println!("{:?}", adapter.info);
     }
 
-    let adapter = adapters.remove(0);
+    let adapter = adapters.drain(..).next().unwrap();
 
     let mut renderer = Renderer::new(instance, surface, adapter);
 
@@ -175,6 +167,7 @@ struct Renderer<B: hal::Backend> {
     dimensions: window::Extent2D,
     viewport: pso::Viewport,
     render_pass: ManuallyDrop<B::RenderPass>,
+    framebuffer: ManuallyDrop<B::Framebuffer>,
     pipeline: ManuallyDrop<B::GraphicsPipeline>,
     pipeline_layout: ManuallyDrop<B::PipelineLayout>,
     desc_set: B::DescriptorSet,
@@ -202,7 +195,7 @@ where
         adapter: hal::adapter::Adapter<B>,
     ) -> Renderer<B> {
         let memory_types = adapter.physical_device.memory_properties().memory_types;
-        let limits = adapter.physical_device.limits();
+        let limits = adapter.physical_device.properties().limits;
 
         // Build a new device and associated command queues
         let family = adapter
@@ -230,7 +223,7 @@ where
         let set_layout = ManuallyDrop::new(
             unsafe {
                 device.create_descriptor_set_layout(
-                    &[pso::DescriptorSetLayoutBinding {
+                    iter::once(pso::DescriptorSetLayoutBinding {
                         binding: 0,
                         ty: pso::DescriptorType::Buffer {
                             ty: pso::BufferDescriptorType::Storage { read_only: true },
@@ -241,8 +234,8 @@ where
                         count: 1,
                         stage_flags: ShaderStageFlags::MESH,
                         immutable_samplers: false,
-                    }],
-                    &[],
+                    }),
+                    iter::empty(),
                 )
             }
             .expect("Can't create descriptor set layout"),
@@ -253,7 +246,7 @@ where
             unsafe {
                 device.create_descriptor_pool(
                     1, // sets
-                    &[pso::DescriptorRangeDesc {
+                    iter::once(pso::DescriptorRangeDesc {
                         ty: pso::DescriptorType::Buffer {
                             ty: pso::BufferDescriptorType::Storage { read_only: true },
                             format: pso::BufferDescriptorFormat::Structured {
@@ -261,13 +254,13 @@ where
                             },
                         },
                         count: 1,
-                    }],
+                    }),
                     pso::DescriptorPoolCreateFlags::empty(),
                 )
             }
             .expect("Can't create descriptor pool"),
         );
-        let desc_set = unsafe { desc_pool.allocate_set(&set_layout) }.unwrap();
+        let mut desc_set = unsafe { desc_pool.allocate_one(&set_layout) }.unwrap();
 
         // Buffer allocations
         println!("Memory types: {:?}", memory_types);
@@ -287,7 +280,14 @@ where
             * non_coherent_alignment;
 
         let mut positions_buffer = ManuallyDrop::new(
-            unsafe { device.create_buffer(padded_buffer_len, buffer::Usage::STORAGE) }.unwrap(),
+            unsafe {
+                device.create_buffer(
+                    padded_buffer_len,
+                    buffer::Usage::STORAGE,
+                    hal::memory::SparseFlags::empty(),
+                )
+            }
+            .unwrap(),
         );
 
         let buffer_req = unsafe { device.get_buffer_requirements(&positions_buffer) };
@@ -307,13 +307,13 @@ where
 
         // TODO: check transitions: read/write mapping and vertex buffer read
         let buffer_memory = unsafe {
-            let memory = device
+            let mut memory = device
                 .allocate_memory(upload_type, buffer_req.size)
                 .unwrap();
             device
                 .bind_buffer_memory(&memory, 0, &mut positions_buffer)
                 .unwrap();
-            let mapping = device.map_memory(&memory, m::Segment::ALL).unwrap();
+            let mapping = device.map_memory(&mut memory, m::Segment::ALL).unwrap();
             ptr::copy_nonoverlapping(
                 positions.as_ptr() as *const u8,
                 mapping,
@@ -322,20 +322,20 @@ where
             device
                 .flush_mapped_memory_ranges(iter::once((&memory, m::Segment::ALL)))
                 .unwrap();
-            device.unmap_memory(&memory);
+            device.unmap_memory(&mut memory);
             ManuallyDrop::new(memory)
         };
 
         unsafe {
-            device.write_descriptor_sets(vec![pso::DescriptorSetWrite {
-                set: &desc_set,
+            device.write_descriptor_set(pso::DescriptorSetWrite {
+                set: &mut desc_set,
                 binding: 0,
                 array_offset: 0,
-                descriptors: Some(pso::Descriptor::Buffer(
+                descriptors: iter::once(pso::Descriptor::Buffer(
                     &*positions_buffer,
                     buffer::SubRange::WHOLE,
                 )),
-            }]);
+            });
         }
 
         let caps = surface.capabilities(&adapter.physical_device);
@@ -352,6 +352,7 @@ where
         let swap_config = window::SwapchainConfig::from_caps(&caps, format, DIMS);
         println!("{:?}", swap_config);
         let extent = swap_config.extent;
+        let fat = swap_config.framebuffer_attachment();
         unsafe {
             surface
                 .configure_swapchain(&device, swap_config)
@@ -379,10 +380,30 @@ where
             };
 
             ManuallyDrop::new(
-                unsafe { device.create_render_pass(&[attachment], &[subpass], &[]) }
-                    .expect("Can't create render pass"),
+                unsafe {
+                    device.create_render_pass(
+                        iter::once(attachment),
+                        iter::once(subpass),
+                        iter::empty(),
+                    )
+                }
+                .expect("Can't create render pass"),
             )
         };
+
+        let framebuffer = ManuallyDrop::new(unsafe {
+            device
+                .create_framebuffer(
+                    &render_pass,
+                    iter::once(fat),
+                    i::Extent {
+                        width: DIMS.width,
+                        height: DIMS.height,
+                        depth: 1,
+                    },
+                )
+                .unwrap()
+        });
 
         // Define maximum number of frames we want to be able to be "in flight" (being computed
         // simultaneously) at once
@@ -429,7 +450,7 @@ where
         }
 
         let pipeline_layout = ManuallyDrop::new(
-            unsafe { device.create_pipeline_layout(iter::once(&*set_layout), &[]) }
+            unsafe { device.create_pipeline_layout(iter::once(&*set_layout), iter::empty()) }
                 .expect("Can't create pipeline layout"),
         );
         let pipeline = {
@@ -516,6 +537,7 @@ where
             dimensions: DIMS,
             viewport,
             render_pass,
+            framebuffer,
             pipeline,
             pipeline_layout,
             desc_set,
@@ -535,16 +557,30 @@ where
         let caps = self.surface.capabilities(&self.adapter.physical_device);
         let swap_config = window::SwapchainConfig::from_caps(&caps, self.format, self.dimensions);
         println!("{:?}", swap_config);
+
         let extent = swap_config.extent.to_extent();
+        self.viewport.rect.w = extent.width as _;
+        self.viewport.rect.h = extent.height as _;
+
+        unsafe {
+            self.device
+                .destroy_framebuffer(ManuallyDrop::into_inner(ptr::read(&self.framebuffer)));
+            self.framebuffer = ManuallyDrop::new(
+                self.device
+                    .create_framebuffer(
+                        &self.render_pass,
+                        iter::once(swap_config.framebuffer_attachment()),
+                        extent,
+                    )
+                    .unwrap(),
+            )
+        };
 
         unsafe {
             self.surface
                 .configure_swapchain(&self.device, swap_config)
                 .expect("Can't create swapchain");
         }
-
-        self.viewport.rect.w = extent.width as _;
-        self.viewport.rect.h = extent.height as _;
     }
 
     fn render(&mut self) {
@@ -558,20 +594,6 @@ where
             }
         };
 
-        let framebuffer = unsafe {
-            self.device
-                .create_framebuffer(
-                    &self.render_pass,
-                    iter::once(surface_image.borrow()),
-                    i::Extent {
-                        width: self.dimensions.width,
-                        height: self.dimensions.height,
-                        depth: 1,
-                    },
-                )
-                .unwrap()
-        };
-
         // Compute index into our resource ring buffers based on the frame number
         // and number of frames in flight. Pay close attention to where this index is needed
         // versus when the swapchain image index we got from acquire_image is needed.
@@ -583,7 +605,7 @@ where
         // updated with a CPU->GPU data copy are not in use by the GPU, so we can perform those updates.
         // In this case there are none to be done, however.
         unsafe {
-            let fence = &self.submission_complete_fences[frame_idx];
+            let fence = &mut self.submission_complete_fences[frame_idx];
             self.device
                 .wait_for_fence(fence, !0)
                 .expect("Failed to wait for fence");
@@ -598,49 +620,47 @@ where
         unsafe {
             cmd_buffer.begin_primary(command::CommandBufferFlags::ONE_TIME_SUBMIT);
 
-            cmd_buffer.set_viewports(0, &[self.viewport.clone()]);
-            cmd_buffer.set_scissors(0, &[self.viewport.rect]);
+            cmd_buffer.set_viewports(0, iter::once(self.viewport.clone()));
+            cmd_buffer.set_scissors(0, iter::once(self.viewport.rect));
             cmd_buffer.bind_graphics_pipeline(&self.pipeline);
             cmd_buffer.bind_graphics_descriptor_sets(
                 &self.pipeline_layout,
                 0,
                 iter::once(&self.desc_set),
-                &[],
+                iter::empty(),
             );
 
             cmd_buffer.begin_render_pass(
                 &self.render_pass,
-                &framebuffer,
+                &self.framebuffer,
                 self.viewport.rect,
-                &[command::ClearValue {
-                    color: command::ClearColor {
-                        float32: [0.8, 0.8, 0.8, 1.0],
+                iter::once(command::RenderAttachmentInfo {
+                    image_view: surface_image.borrow(),
+                    clear_value: command::ClearValue {
+                        color: command::ClearColor {
+                            float32: [0.8, 0.8, 0.8, 1.0],
+                        },
                     },
-                }],
+                }),
                 command::SubpassContents::Inline,
             );
             cmd_buffer.draw_mesh_tasks(1, 0);
             cmd_buffer.end_render_pass();
             cmd_buffer.finish();
 
-            let submission = Submission {
-                command_buffers: iter::once(&*cmd_buffer),
-                wait_semaphores: None,
-                signal_semaphores: iter::once(&self.submission_complete_semaphores[frame_idx]),
-            };
             self.queue_group.queues[0].submit(
-                submission,
-                Some(&self.submission_complete_fences[frame_idx]),
+                iter::once(&*cmd_buffer),
+                iter::empty(),
+                iter::once(&self.submission_complete_semaphores[frame_idx]),
+                Some(&mut self.submission_complete_fences[frame_idx]),
             );
 
             // present frame
             let result = self.queue_group.queues[0].present(
                 &mut self.surface,
                 surface_image,
-                Some(&self.submission_complete_semaphores[frame_idx]),
+                Some(&mut self.submission_complete_semaphores[frame_idx]),
             );
-
-            self.device.destroy_framebuffer(framebuffer);
 
             if result.is_err() {
                 self.recreate_swapchain();
@@ -680,6 +700,8 @@ where
             }
             self.device
                 .destroy_render_pass(ManuallyDrop::into_inner(ptr::read(&self.render_pass)));
+            self.device
+                .destroy_framebuffer(ManuallyDrop::into_inner(ptr::read(&self.framebuffer)));
             self.surface.unconfigure_swapchain(&self.device);
             self.device
                 .free_memory(ManuallyDrop::into_inner(ptr::read(&self.buffer_memory)));

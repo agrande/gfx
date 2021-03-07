@@ -48,7 +48,7 @@ use hal::{
     image as i, memory as m, pass, pool,
     prelude::*,
     pso,
-    queue::{QueueGroup, Submission},
+    queue::QueueGroup,
     window as w, Backend,
 };
 
@@ -103,7 +103,6 @@ struct RendererState<B: Backend> {
     img_desc_pool: Option<B::DescriptorPool>,
     swapchain: SwapchainState,
     device: Rc<RefCell<DeviceState<B>>>,
-    backend: BackendState<B>,
     vertex_buffer: BufferState<B>,
     render_pass: RenderPassState<B>,
     uniform: Uniform<B>,
@@ -116,6 +115,8 @@ struct RendererState<B: Backend> {
     bg_color: pso::ColorValue,
     cur_color: Color,
     cur_value: u32,
+    // Note the drop order!
+    backend: BackendState<B>,
 }
 
 #[derive(Debug)]
@@ -178,7 +179,7 @@ impl<B: Backend> RendererState<B> {
             .device
             .create_descriptor_pool(
                 1, // # of sets
-                &[
+                vec![
                     pso::DescriptorRangeDesc {
                         ty: pso::DescriptorType::Image {
                             ty: pso::ImageDescriptorType::Sampled {
@@ -191,7 +192,8 @@ impl<B: Backend> RendererState<B> {
                         ty: pso::DescriptorType::Sampler,
                         count: 1,
                     },
-                ],
+                ]
+                .into_iter(),
                 pso::DescriptorPoolCreateFlags::empty(),
             )
             .ok();
@@ -201,7 +203,7 @@ impl<B: Backend> RendererState<B> {
             .device
             .create_descriptor_pool(
                 1, // # of sets
-                &[pso::DescriptorRangeDesc {
+                iter::once(pso::DescriptorRangeDesc {
                     ty: pso::DescriptorType::Buffer {
                         ty: pso::BufferDescriptorType::Uniform,
                         format: pso::BufferDescriptorFormat::Structured {
@@ -209,7 +211,7 @@ impl<B: Backend> RendererState<B> {
                         },
                     },
                     count: 1,
-                }],
+                }),
                 pso::DescriptorPoolCreateFlags::empty(),
             )
             .ok();
@@ -271,10 +273,20 @@ impl<B: Backend> RendererState<B> {
 
         let swapchain = SwapchainState::new(&mut *backend.surface, &*device.borrow());
         let render_pass = RenderPassState::new(&swapchain, Rc::clone(&device));
-        let framebuffer = FramebufferState::new(Rc::clone(&device), swapchain.frame_queue_size);
+        let framebuffer = device
+            .borrow()
+            .device
+            .create_framebuffer(
+                render_pass.render_pass.as_ref().unwrap(),
+                iter::once(swapchain.fat.clone()),
+                swapchain.extent,
+            )
+            .unwrap();
+        let framebuffer =
+            FramebufferState::new(Rc::clone(&device), swapchain.frame_queue_size, framebuffer);
 
         let pipeline = PipelineState::new(
-            vec![image.get_layout(), uniform.get_layout()],
+            vec![image.get_layout(), uniform.get_layout()].into_iter(),
             render_pass.render_pass.as_ref().unwrap(),
             Rc::clone(&device),
         );
@@ -303,7 +315,8 @@ impl<B: Backend> RendererState<B> {
     }
 
     fn recreate_swapchain(&mut self) {
-        self.device.borrow().device.wait_idle().unwrap();
+        let device = &self.device.borrow().device;
+        device.wait_idle().unwrap();
 
         self.swapchain =
             unsafe { SwapchainState::new(&mut *self.backend.surface, &*self.device.borrow()) };
@@ -311,13 +324,28 @@ impl<B: Backend> RendererState<B> {
         self.render_pass =
             unsafe { RenderPassState::new(&self.swapchain, Rc::clone(&self.device)) };
 
+        let framebuffer = unsafe {
+            device.destroy_framebuffer(self.framebuffer.framebuffer.take().unwrap());
+            device
+                .create_framebuffer(
+                    self.render_pass.render_pass.as_ref().unwrap(),
+                    iter::once(self.swapchain.fat.clone()),
+                    self.swapchain.extent,
+                )
+                .unwrap()
+        };
+
         self.framebuffer = unsafe {
-            FramebufferState::new(Rc::clone(&self.device), self.swapchain.frame_queue_size)
+            FramebufferState::new(
+                Rc::clone(&self.device),
+                self.swapchain.frame_queue_size,
+                framebuffer,
+            )
         };
 
         self.pipeline = unsafe {
             PipelineState::new(
-                vec![self.image.get_layout(), self.uniform.get_layout()],
+                vec![self.image.get_layout(), self.uniform.get_layout()].into_iter(),
                 self.render_pass.render_pass.as_ref().unwrap(),
                 Rc::clone(&self.device),
             )
@@ -342,40 +370,38 @@ impl<B: Backend> RendererState<B> {
             }
         };
 
-        let framebuffer = unsafe {
-            self.device
-                .borrow()
-                .device
-                .create_framebuffer(
-                    self.render_pass.render_pass.as_ref().unwrap(),
-                    iter::once(std::borrow::Borrow::borrow(&surface_image)),
-                    self.swapchain.extent,
-                )
-                .unwrap()
-        };
-
         let frame_idx = (self.swapchain.frame_index % self.swapchain.frame_queue_size) as usize;
         self.swapchain.frame_index += 1;
 
-        let (command_pool, command_buffers, sem_image_present) =
+        let (framebuffer, command_pool, command_buffers, sem_image_present) =
             self.framebuffer.get_frame_data(frame_idx);
 
         unsafe {
+            // Rendering
+            let (mut cmd_buffer, mut fence) = match command_buffers.pop() {
+                Some((cmd_buffer, fence)) => (cmd_buffer, fence),
+                None => (
+                    command_pool.allocate_one(command::Level::Primary),
+                    self.device.borrow().device.create_fence(true).unwrap(),
+                ),
+            };
+
+            self.device
+                .borrow()
+                .device
+                .wait_for_fence(&mut fence, u64::MAX);
+            self.device.borrow().device.reset_fence(&mut fence);
+            // cmd_buffer.reset(true);
             command_pool.reset(false);
 
-            // Rendering
-            let mut cmd_buffer = match command_buffers.pop() {
-                Some(cmd_buffer) => cmd_buffer,
-                None => command_pool.allocate_one(command::Level::Primary),
-            };
             cmd_buffer.begin_primary(command::CommandBufferFlags::ONE_TIME_SUBMIT);
             cmd_buffer.begin_debug_marker("setup", 0);
-            cmd_buffer.set_viewports(0, &[self.viewport.clone()]);
-            cmd_buffer.set_scissors(0, &[self.viewport.rect]);
+            cmd_buffer.set_viewports(0, iter::once(self.viewport.clone()));
+            cmd_buffer.set_scissors(0, iter::once(self.viewport.rect));
             cmd_buffer.bind_graphics_pipeline(self.pipeline.pipeline.as_ref().unwrap());
             cmd_buffer.bind_vertex_buffers(
                 0,
-                Some((self.vertex_buffer.get_buffer(), buffer::SubRange::WHOLE)),
+                iter::once((self.vertex_buffer.get_buffer(), buffer::SubRange::WHOLE)),
             );
             cmd_buffer.bind_graphics_descriptor_sets(
                 self.pipeline.pipeline_layout.as_ref().unwrap(),
@@ -383,20 +409,24 @@ impl<B: Backend> RendererState<B> {
                 vec![
                     self.image.desc.set.as_ref().unwrap(),
                     self.uniform.desc.as_ref().unwrap().set.as_ref().unwrap(),
-                ],
-                &[],
+                ]
+                .into_iter(),
+                iter::empty(),
             ); //TODO
             cmd_buffer.end_debug_marker();
 
             cmd_buffer.begin_render_pass(
                 self.render_pass.render_pass.as_ref().unwrap(),
-                &framebuffer,
+                framebuffer,
                 self.viewport.rect,
-                &[command::ClearValue {
-                    color: command::ClearColor {
-                        float32: self.bg_color,
+                iter::once(command::RenderAttachmentInfo {
+                    image_view: std::borrow::Borrow::borrow(&surface_image),
+                    clear_value: command::ClearValue {
+                        color: command::ClearColor {
+                            float32: self.bg_color,
+                        },
                     },
-                }],
+                }),
                 command::SubpassContents::Inline,
             );
             cmd_buffer.draw(0..6, 0..1);
@@ -404,14 +434,13 @@ impl<B: Backend> RendererState<B> {
             cmd_buffer.insert_debug_marker("done", 0);
             cmd_buffer.finish();
 
-            let submission = Submission {
-                command_buffers: iter::once(&cmd_buffer),
-                wait_semaphores: None,
-                signal_semaphores: iter::once(&*sem_image_present),
-            };
-
-            self.device.borrow_mut().queues.queues[0].submit(submission, None);
-            command_buffers.push(cmd_buffer);
+            self.device.borrow_mut().queues.queues[0].submit(
+                iter::once(&cmd_buffer),
+                iter::empty(),
+                iter::once(&*sem_image_present),
+                Some(&mut fence),
+            );
+            command_buffers.push((cmd_buffer, fence));
 
             // present frame
             if let Err(_) = self.device.borrow_mut().queues.queues[0].present(
@@ -421,8 +450,6 @@ impl<B: Backend> RendererState<B> {
             ) {
                 self.recreate_swapchain = true;
             }
-
-            self.device.borrow().device.destroy_framebuffer(framebuffer);
         }
     }
 
@@ -510,9 +537,9 @@ impl<B: Backend> Drop for RendererState<B> {
 }
 
 struct BackendState<B: Backend> {
-    instance: Option<B::Instance>,
     surface: ManuallyDrop<B::Surface>,
     adapter: AdapterState<B>,
+    instance: B::Instance,
     /// Needs to be kept alive even if its not used directly
     #[allow(dead_code)]
     window: winit::window::Window,
@@ -520,11 +547,9 @@ struct BackendState<B: Backend> {
 
 impl<B: Backend> Drop for BackendState<B> {
     fn drop(&mut self) {
-        if let Some(instance) = &self.instance {
-            unsafe {
-                let surface = ManuallyDrop::into_inner(ptr::read(&self.surface));
-                instance.destroy_surface(surface);
-            }
+        unsafe {
+            let surface = ManuallyDrop::into_inner(ptr::read(&self.surface));
+            self.instance.destroy_surface(surface);
         }
     }
 }
@@ -550,7 +575,7 @@ fn create_backend(
     };
     let mut adapters = instance.enumerate_adapters();
     BackendState {
-        instance: Some(instance),
+        instance,
         adapter: AdapterState::new(&mut adapters),
         surface: ManuallyDrop::new(surface),
         window,
@@ -576,7 +601,7 @@ impl<B: Backend> AdapterState<B> {
 
     fn new_adapter(adapter: Adapter<B>) -> Self {
         let memory_types = adapter.physical_device.memory_properties().memory_types;
-        let limits = adapter.physical_device.limits();
+        let limits = adapter.physical_device.properties().limits;
         println!("{:?}", limits);
 
         AdapterState {
@@ -647,7 +672,7 @@ impl<B: Backend> RenderPassState<B> {
             device
                 .borrow()
                 .device
-                .create_render_pass(&[attachment], &[subpass], &[])
+                .create_render_pass(iter::once(attachment), iter::once(subpass), iter::empty())
                 .ok()
         };
         if let Some(ref mut rp) = render_pass {
@@ -691,7 +716,7 @@ impl<B: Backend> BufferState<B> {
     where
         T: Copy,
     {
-        let memory: B::Memory;
+        let mut memory: B::Memory;
         let mut buffer: B::Buffer;
         let size: u64;
 
@@ -701,7 +726,9 @@ impl<B: Backend> BufferState<B> {
         {
             let device = &device_ptr.borrow().device;
 
-            buffer = device.create_buffer(upload_size as u64, usage).unwrap();
+            buffer = device
+                .create_buffer(upload_size as u64, usage, hal::memory::SparseFlags::empty())
+                .unwrap();
             let mem_req = device.get_buffer_requirements(&buffer);
 
             // A note about performance: Using CPU_VISIBLE memory is convenient because it can be
@@ -726,9 +753,9 @@ impl<B: Backend> BufferState<B> {
             size = mem_req.size;
 
             // TODO: check transitions: read/write mapping and vertex buffer read
-            let mapping = device.map_memory(&memory, m::Segment::ALL).unwrap();
+            let mapping = device.map_memory(&mut memory, m::Segment::ALL).unwrap();
             ptr::copy_nonoverlapping(data_source.as_ptr() as *const u8, mapping, upload_size);
-            device.unmap_memory(&memory);
+            device.unmap_memory(&mut memory);
         }
 
         BufferState {
@@ -749,7 +776,7 @@ impl<B: Backend> BufferState<B> {
         let upload_size = data_source.len() * stride;
 
         assert!(offset + upload_size as u64 <= self.size);
-        let memory = self.memory.as_ref().unwrap();
+        let memory = self.memory.as_mut().unwrap();
 
         unsafe {
             let mapping = device
@@ -775,12 +802,14 @@ impl<B: Backend> BufferState<B> {
         let row_pitch = (width * stride as u32 + row_alignment_mask) & !row_alignment_mask;
         let upload_size = (height * row_pitch) as u64;
 
-        let memory: B::Memory;
+        let mut memory: B::Memory;
         let mut buffer: B::Buffer;
         let size: u64;
 
         {
-            buffer = device.create_buffer(upload_size, usage).unwrap();
+            buffer = device
+                .create_buffer(upload_size, usage, hal::memory::SparseFlags::empty(),)
+                .unwrap();
             let mem_reqs = device.get_buffer_requirements(&buffer);
 
             let upload_type = adapter
@@ -801,7 +830,7 @@ impl<B: Backend> BufferState<B> {
             size = mem_reqs.size;
 
             // copy image data into staging buffer
-            let mapping = device.map_memory(&memory, m::Segment::ALL).unwrap();
+            let mapping = device.map_memory(&mut memory, m::Segment::ALL).unwrap();
             for y in 0..height as usize {
                 let data_source_slice =
                     &(**img)[y * (width as usize) * stride..(y + 1) * (width as usize) * stride];
@@ -811,7 +840,7 @@ impl<B: Backend> BufferState<B> {
                     data_source_slice.len(),
                 );
             }
-            device.unmap_memory(&memory);
+            device.unmap_memory(&mut memory);
         }
 
         (
@@ -863,14 +892,14 @@ impl<B: Backend> Uniform<B> {
         let buffer = Some(buffer);
 
         desc.write_to_state(
-            vec![DescSetWrite {
+            DescSetWrite {
                 binding,
                 array_offset: 0,
-                descriptors: Some(pso::Descriptor::Buffer(
+                descriptors: iter::once(pso::Descriptor::Buffer(
                     buffer.as_ref().unwrap().get_buffer(),
                     buffer::SubRange::WHOLE,
                 )),
-            }],
+            },
             &mut device.borrow_mut().device,
         );
 
@@ -898,7 +927,7 @@ impl<B: Backend> DescSetLayout<B> {
         let desc_set_layout = device
             .borrow()
             .device
-            .create_descriptor_set_layout(bindings, &[])
+            .create_descriptor_set_layout(bindings.into_iter(), iter::empty())
             .ok();
 
         DescSetLayout {
@@ -914,7 +943,7 @@ impl<B: Backend> DescSetLayout<B> {
         device: Rc<RefCell<DeviceState<B>>>,
     ) -> DescSet<B> {
         let mut desc_set = desc_pool
-            .allocate_set(self.layout.as_ref().unwrap())
+            .allocate_one(self.layout.as_ref().unwrap())
             .unwrap();
         device
             .borrow()
@@ -950,23 +979,18 @@ struct DescSetWrite<W> {
 impl<B: Backend> DescSet<B> {
     unsafe fn write_to_state<'a, 'b: 'a, W>(
         &'b mut self,
-        write: Vec<DescSetWrite<W>>,
+        d: DescSetWrite<W>,
         device: &mut B::Device,
     ) where
-        W: IntoIterator,
-        W::Item: std::borrow::Borrow<pso::Descriptor<'a, B>>,
+        W: Iterator<Item = pso::Descriptor<'a, B>>,
     {
-        let set = self.set.as_ref().unwrap();
-        let write: Vec<_> = write
-            .into_iter()
-            .map(|d| pso::DescriptorSetWrite {
-                binding: d.binding,
-                array_offset: d.array_offset,
-                descriptors: d.descriptors,
-                set,
-            })
-            .collect();
-        device.write_descriptor_sets(write);
+        let set = self.set.as_mut().unwrap();
+        device.write_descriptor_set(pso::DescriptorSetWrite {
+            binding: d.binding,
+            array_offset: d.array_offset,
+            descriptors: d.descriptors,
+            set,
+        });
     }
 
     fn get_layout(&self) -> &B::DescriptorSetLayout {
@@ -1012,6 +1036,7 @@ impl<B: Backend> ImageState<B> {
                 ColorFormat::SELF,
                 i::Tiling::Optimal,
                 i::Usage::TRANSFER_DST | i::Usage::SAMPLED,
+                hal::memory::SparseFlags::empty(),
                 i::ViewCapabilities::empty(),
             )
             .unwrap(); // TODO: usage
@@ -1049,21 +1074,22 @@ impl<B: Backend> ImageState<B> {
             .expect("Can't create sampler");
 
         desc.write_to_state(
-            vec![
-                DescSetWrite {
-                    binding: 0,
-                    array_offset: 0,
-                    descriptors: Some(pso::Descriptor::Image(
-                        &image_view,
-                        i::Layout::ShaderReadOnlyOptimal,
-                    )),
-                },
-                DescSetWrite {
-                    binding: 1,
-                    array_offset: 0,
-                    descriptors: Some(pso::Descriptor::Sampler(&sampler)),
-                },
-            ],
+            DescSetWrite {
+                binding: 0,
+                array_offset: 0,
+                descriptors: iter::once(pso::Descriptor::Image(
+                    &image_view,
+                    i::Layout::ShaderReadOnlyOptimal,
+                )),
+            },
+            device,
+        );
+        desc.write_to_state(
+            DescSetWrite {
+                binding: 1,
+                array_offset: 0,
+                descriptors: iter::once(pso::Descriptor::Sampler(&sampler)),
+            },
             device,
         );
 
@@ -1088,14 +1114,14 @@ impl<B: Backend> ImageState<B> {
             cmd_buffer.pipeline_barrier(
                 pso::PipelineStage::TOP_OF_PIPE..pso::PipelineStage::TRANSFER,
                 m::Dependencies::empty(),
-                &[image_barrier],
+                iter::once(image_barrier),
             );
 
             cmd_buffer.copy_buffer_to_image(
                 buffer.as_ref().unwrap().get_buffer(),
                 &image,
                 i::Layout::TransferDstOptimal,
-                &[command::BufferImageCopy {
+                iter::once(command::BufferImageCopy {
                     buffer_offset: 0,
                     buffer_width: row_pitch / (stride as u32),
                     buffer_height: dims.height as u32,
@@ -1110,7 +1136,7 @@ impl<B: Backend> ImageState<B> {
                         height: dims.height,
                         depth: 1,
                     },
-                }],
+                }),
             );
 
             let image_barrier = m::Barrier::Image {
@@ -1126,13 +1152,15 @@ impl<B: Backend> ImageState<B> {
             cmd_buffer.pipeline_barrier(
                 pso::PipelineStage::TRANSFER..pso::PipelineStage::FRAGMENT_SHADER,
                 m::Dependencies::empty(),
-                &[image_barrier],
+                iter::once(image_barrier),
             );
 
             cmd_buffer.finish();
 
-            device_state.queues.queues[0].submit_without_semaphores(
+            device_state.queues.queues[0].submit(
                 iter::once(&cmd_buffer),
+                iter::empty(),
+                iter::empty(),
                 Some(&mut transfered_image_fence),
             );
         }
@@ -1188,19 +1216,20 @@ struct PipelineState<B: Backend> {
 }
 
 impl<B: Backend> PipelineState<B> {
-    unsafe fn new<IS>(
-        desc_layouts: IS,
+    unsafe fn new<'a, Is>(
+        desc_layouts: Is,
         render_pass: &B::RenderPass,
         device_ptr: Rc<RefCell<DeviceState<B>>>,
     ) -> Self
     where
-        IS: IntoIterator,
-        IS::Item: std::borrow::Borrow<B::DescriptorSetLayout>,
-        IS::IntoIter: ExactSizeIterator,
+        Is: Iterator<Item = &'a B::DescriptorSetLayout>,
     {
         let device = &device_ptr.borrow().device;
         let pipeline_layout = device
-            .create_pipeline_layout(desc_layouts, &[(pso::ShaderStageFlags::VERTEX, 0..8)])
+            .create_pipeline_layout(
+                desc_layouts,
+                iter::once((pso::ShaderStageFlags::VERTEX, 0..8)),
+            )
             .expect("Can't create pipeline layout");
 
         let pipeline = {
@@ -1318,6 +1347,7 @@ struct SwapchainState {
     format: f::Format,
     frame_index: u32,
     frame_queue_size: u32,
+    fat: i::FramebufferAttachment,
 }
 
 impl SwapchainState {
@@ -1335,6 +1365,7 @@ impl SwapchainState {
 
         println!("Surface format: {:?}", format);
         let swap_config = w::SwapchainConfig::from_caps(&caps, format, DIMS);
+        let fat = swap_config.framebuffer_attachment();
         let extent = swap_config.extent.to_extent();
         let frame_queue_size = swap_config.image_count;
         surface
@@ -1346,6 +1377,7 @@ impl SwapchainState {
             format,
             frame_index: 0,
             frame_queue_size,
+            fat,
         }
     }
 
@@ -1363,14 +1395,19 @@ impl SwapchainState {
 }
 
 struct FramebufferState<B: Backend> {
+    framebuffer: Option<B::Framebuffer>,
     command_pools: Option<Vec<B::CommandPool>>,
-    command_buffer_lists: Vec<Vec<B::CommandBuffer>>,
+    command_buffer_lists: Vec<Vec<(B::CommandBuffer, B::Fence)>>,
     present_semaphores: Option<Vec<B::Semaphore>>,
     device: Rc<RefCell<DeviceState<B>>>,
 }
 
 impl<B: Backend> FramebufferState<B> {
-    unsafe fn new(device: Rc<RefCell<DeviceState<B>>>, num_frames: u32) -> Self {
+    unsafe fn new(
+        device: Rc<RefCell<DeviceState<B>>>,
+        num_frames: u32,
+        framebuffer: B::Framebuffer,
+    ) -> Self {
         let mut command_pools: Vec<_> = vec![];
         let mut command_buffer_lists = Vec::new();
         let mut present_semaphores: Vec<B::Semaphore> = vec![];
@@ -1392,6 +1429,7 @@ impl<B: Backend> FramebufferState<B> {
         }
 
         FramebufferState {
+            framebuffer: Some(framebuffer),
             command_pools: Some(command_pools),
             command_buffer_lists,
             present_semaphores: Some(present_semaphores),
@@ -1403,11 +1441,13 @@ impl<B: Backend> FramebufferState<B> {
         &mut self,
         index: usize,
     ) -> (
+        &B::Framebuffer,
         &mut B::CommandPool,
-        &mut Vec<B::CommandBuffer>,
+        &mut Vec<(B::CommandBuffer, B::Fence)>,
         &mut B::Semaphore,
     ) {
         (
+            self.framebuffer.as_ref().unwrap(),
             &mut self.command_pools.as_mut().unwrap()[index],
             &mut self.command_buffer_lists[index],
             &mut self.present_semaphores.as_mut().unwrap()[index],
@@ -1420,6 +1460,9 @@ impl<B: Backend> Drop for FramebufferState<B> {
         let device = &self.device.borrow().device;
 
         unsafe {
+            if let Some(fb) = self.framebuffer.take() {
+                device.destroy_framebuffer(fb);
+            }
             for (mut command_pool, comamnd_buffer_list) in self
                 .command_pools
                 .take()
@@ -1427,7 +1470,8 @@ impl<B: Backend> Drop for FramebufferState<B> {
                 .into_iter()
                 .zip(self.command_buffer_lists.drain(..))
             {
-                command_pool.free(comamnd_buffer_list);
+                
+                command_pool.free(comamnd_buffer_list.into_iter().map(|(c,f)| {device.destroy_fence(f); c}));
                 device.destroy_command_pool(command_pool);
             }
 

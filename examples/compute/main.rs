@@ -13,6 +13,14 @@
 extern crate gfx_backend_dx11 as back;
 #[cfg(feature = "dx12")]
 extern crate gfx_backend_dx12 as back;
+#[cfg(not(any(
+    feature = "vulkan",
+    feature = "gl",
+    feature = "dx11",
+    feature = "dx12",
+    feature = "metal",
+)))]
+extern crate gfx_backend_empty as back;
 #[cfg(feature = "gl")]
 extern crate gfx_backend_gl as back;
 #[cfg(feature = "metal")]
@@ -20,17 +28,10 @@ extern crate gfx_backend_metal as back;
 #[cfg(feature = "vulkan")]
 extern crate gfx_backend_vulkan as back;
 
-use std::{fs, ptr, slice, str::FromStr};
+use std::{fs, iter, ptr, slice, str::FromStr};
 
 use hal::{adapter::MemoryType, buffer, command, memory, pool, prelude::*, pso};
 
-#[cfg(any(
-    feature = "vulkan",
-    feature = "gl",
-    feature = "dx11",
-    feature = "dx12",
-    feature = "metal",
-))]
 fn main() {
     env_logger::init();
 
@@ -42,7 +43,7 @@ fn main() {
         .skip(1)
         .map(|s| u32::from_str(&s).expect("You must pass a list of positive integers!"))
         .collect();
-    let stride = std::mem::size_of::<u32>() as u64;
+    let stride = std::mem::size_of::<u32>() as buffer::Stride;
 
     let instance =
         back::Instance::create("gfx-rs compute", 1).expect("Failed to create an instance!");
@@ -80,7 +81,7 @@ fn main() {
     let (pipeline_layout, pipeline, set_layout, mut desc_pool) = {
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
-                &[pso::DescriptorSetLayoutBinding {
+                iter::once(pso::DescriptorSetLayoutBinding {
                     binding: 0,
                     ty: pso::DescriptorType::Buffer {
                         ty: pso::BufferDescriptorType::Storage { read_only: false },
@@ -91,14 +92,15 @@ fn main() {
                     count: 1,
                     stage_flags: pso::ShaderStageFlags::COMPUTE,
                     immutable_samplers: false,
-                }],
-                &[],
+                }),
+                iter::empty(),
             )
         }
         .expect("Can't create descriptor set layout");
 
-        let pipeline_layout = unsafe { device.create_pipeline_layout(Some(&set_layout), &[]) }
-            .expect("Can't create pipeline layout");
+        let pipeline_layout =
+            unsafe { device.create_pipeline_layout(iter::once(&set_layout), iter::empty()) }
+                .expect("Can't create pipeline layout");
         let entry_point = pso::EntryPoint {
             entry: "main",
             module: &shader,
@@ -115,7 +117,7 @@ fn main() {
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 1,
-                &[pso::DescriptorRangeDesc {
+                iter::once(pso::DescriptorRangeDesc {
                     ty: pso::DescriptorType::Buffer {
                         ty: pso::BufferDescriptorType::Storage { read_only: false },
                         format: pso::BufferDescriptorFormat::Structured {
@@ -123,7 +125,7 @@ fn main() {
                         },
                     },
                     count: 1,
-                }],
+                }),
                 pso::DescriptorPoolCreateFlags::empty(),
             )
         }
@@ -131,7 +133,7 @@ fn main() {
         (pipeline_layout, pipeline, set_layout, desc_pool)
     };
 
-    let (staging_memory, staging_buffer, _staging_size) = unsafe {
+    let (mut staging_memory, staging_buffer, _staging_size) = unsafe {
         create_buffer::<back::Backend>(
             &device,
             &memory_properties.memory_types,
@@ -144,14 +146,14 @@ fn main() {
 
     unsafe {
         let mapping = device
-            .map_memory(&staging_memory, memory::Segment::ALL)
+            .map_memory(&mut staging_memory, memory::Segment::ALL)
             .unwrap();
         ptr::copy_nonoverlapping(
             numbers.as_ptr() as *const u8,
             mapping,
             numbers.len() * stride as usize,
         );
-        device.unmap_memory(&staging_memory);
+        device.unmap_memory(&mut staging_memory);
     }
 
     let (device_memory, device_buffer, _device_buffer_size) = unsafe {
@@ -165,41 +167,40 @@ fn main() {
         )
     };
 
-    let desc_set;
-
-    unsafe {
-        desc_set = desc_pool.allocate_set(&set_layout).unwrap();
-        device.write_descriptor_sets(Some(pso::DescriptorSetWrite {
-            set: &desc_set,
+    let desc_set = unsafe {
+        let mut desc_set = desc_pool.allocate_one(&set_layout).unwrap();
+        device.write_descriptor_set(pso::DescriptorSetWrite {
+            set: &mut desc_set,
             binding: 0,
             array_offset: 0,
-            descriptors: Some(pso::Descriptor::Buffer(
+            descriptors: iter::once(pso::Descriptor::Buffer(
                 &device_buffer,
                 buffer::SubRange::WHOLE,
             )),
-        }));
+        });
+        desc_set
     };
 
     let mut command_pool =
         unsafe { device.create_command_pool(family.id(), pool::CommandPoolCreateFlags::empty()) }
             .expect("Can't create command pool");
-    let fence = device.create_fence(false).unwrap();
+    let mut fence = device.create_fence(false).unwrap();
     unsafe {
         let mut command_buffer = command_pool.allocate_one(command::Level::Primary);
         command_buffer.begin_primary(command::CommandBufferFlags::ONE_TIME_SUBMIT);
         command_buffer.copy_buffer(
             &staging_buffer,
             &device_buffer,
-            &[command::BufferCopy {
+            iter::once(command::BufferCopy {
                 src: 0,
                 dst: 0,
-                size: stride * numbers.len() as u64,
-            }],
+                size: stride as u64 * numbers.len() as u64,
+            }),
         );
         command_buffer.pipeline_barrier(
             pso::PipelineStage::TRANSFER..pso::PipelineStage::COMPUTE_SHADER,
             memory::Dependencies::empty(),
-            Some(memory::Barrier::Buffer {
+            iter::once(memory::Barrier::Buffer {
                 states: buffer::Access::TRANSFER_WRITE
                     ..buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE,
                 families: None,
@@ -208,12 +209,17 @@ fn main() {
             }),
         );
         command_buffer.bind_compute_pipeline(&pipeline);
-        command_buffer.bind_compute_descriptor_sets(&pipeline_layout, 0, &[desc_set], &[]);
+        command_buffer.bind_compute_descriptor_sets(
+            &pipeline_layout,
+            0,
+            iter::once(&desc_set),
+            iter::empty(),
+        );
         command_buffer.dispatch([numbers.len() as u32, 1, 1]);
         command_buffer.pipeline_barrier(
             pso::PipelineStage::COMPUTE_SHADER..pso::PipelineStage::TRANSFER,
             memory::Dependencies::empty(),
-            Some(memory::Barrier::Buffer {
+            iter::once(memory::Barrier::Buffer {
                 states: buffer::Access::SHADER_READ | buffer::Access::SHADER_WRITE
                     ..buffer::Access::TRANSFER_READ,
                 families: None,
@@ -224,29 +230,34 @@ fn main() {
         command_buffer.copy_buffer(
             &device_buffer,
             &staging_buffer,
-            &[command::BufferCopy {
+            iter::once(command::BufferCopy {
                 src: 0,
                 dst: 0,
-                size: stride * numbers.len() as u64,
-            }],
+                size: stride as u64 * numbers.len() as u64,
+            }),
         );
         command_buffer.finish();
 
-        queue_group.queues[0].submit_without_semaphores(Some(&command_buffer), Some(&fence));
+        queue_group.queues[0].submit(
+            iter::once(&command_buffer),
+            iter::empty(),
+            iter::empty(),
+            Some(&mut fence),
+        );
 
         device.wait_for_fence(&fence, !0).unwrap();
-        command_pool.free(Some(command_buffer));
+        command_pool.free(iter::once(command_buffer));
     }
 
     unsafe {
         let mapping = device
-            .map_memory(&staging_memory, memory::Segment::ALL)
+            .map_memory(&mut staging_memory, memory::Segment::ALL)
             .unwrap();
         println!(
             "Times: {:?}",
             slice::from_raw_parts::<u32>(mapping as *const u8 as *const u32, numbers.len()),
         );
-        device.unmap_memory(&staging_memory);
+        device.unmap_memory(&mut staging_memory);
     }
 
     unsafe {
@@ -269,10 +280,12 @@ unsafe fn create_buffer<B: hal::Backend>(
     memory_types: &[MemoryType],
     properties: memory::Properties,
     usage: buffer::Usage,
-    stride: u64,
+    stride: buffer::Stride,
     len: u64,
 ) -> (B::Memory, B::Buffer, u64) {
-    let mut buffer = device.create_buffer(stride * len, usage).unwrap();
+    let mut buffer = device
+        .create_buffer(stride as u64 * len, usage, hal::memory::SparseFlags::empty())
+        .unwrap();
     let requirements = device.get_buffer_requirements(&buffer);
 
     let ty = memory_types
@@ -288,15 +301,4 @@ unsafe fn create_buffer<B: hal::Backend>(
     device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
 
     (memory, buffer, requirements.size)
-}
-
-#[cfg(not(any(
-    feature = "vulkan",
-    feature = "gl",
-    feature = "dx11",
-    feature = "dx12",
-    feature = "metal"
-)))]
-fn main() {
-    println!("You need to enable one of the next-gen API feature (vulkan, dx12, metal) to run this example.");
 }

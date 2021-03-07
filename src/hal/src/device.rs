@@ -12,7 +12,7 @@
 //! and is used to actually do things.
 
 use crate::{
-    buffer, format, image,
+    buffer, format, image, memory,
     memory::{Requirements, Segment},
     pass,
     pool::CommandPoolCreateFlags,
@@ -23,7 +23,7 @@ use crate::{
     Backend, MemoryTypeId,
 };
 
-use std::{any::Any, borrow::Borrow, fmt, iter, ops::Range};
+use std::{any::Any, fmt, iter, ops::Range};
 
 /// Error occurred caused device to be lost.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -73,10 +73,6 @@ pub enum CreationError {
     /// Device initialization failed due to implementation specific errors.
     #[error("Implementation specific error occurred")]
     InitializationFailed,
-    /// At least one of the user requested extensions if not supported by the
-    /// physical device.
-    #[error("Requested extension is missing")]
-    MissingExtension,
     /// At least one of the user requested features if not supported by the
     /// physical device.
     ///
@@ -162,6 +158,15 @@ pub enum ShaderModuleDesc<'a> {
     SpirV(&'a [u32]),
 }
 
+/// Naga shader module.
+#[allow(missing_debug_implementations)]
+pub struct NagaShader {
+    /// Shader module IR.
+    pub module: naga::Module,
+    /// Analysis of the module.
+    pub analysis: naga::proc::analyzer::Analysis,
+}
+
 /// Logical device handle, responsible for creating and managing resources
 /// for the physical device it was created from.
 ///
@@ -224,22 +229,16 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     ///   You need to use at least one subpass.
     /// * `dependencies` - [dependencies between subpasses][crate::pass::SubpassDependency].
     ///   Can be empty.
-    unsafe fn create_render_pass<'a, IA, IS, ID>(
+    unsafe fn create_render_pass<'a, Ia, Is, Id>(
         &self,
-        attachments: IA,
-        subpasses: IS,
-        dependencies: ID,
+        attachments: Ia,
+        subpasses: Is,
+        dependencies: Id,
     ) -> Result<B::RenderPass, OutOfMemory>
     where
-        IA: IntoIterator,
-        IA::Item: Borrow<pass::Attachment>,
-        IA::IntoIter: ExactSizeIterator,
-        IS: IntoIterator,
-        IS::Item: Borrow<pass::SubpassDesc<'a>>,
-        IS::IntoIter: ExactSizeIterator,
-        ID: IntoIterator,
-        ID::Item: Borrow<pass::SubpassDependency>,
-        ID::IntoIter: ExactSizeIterator;
+        Ia: Iterator<Item = pass::Attachment>,
+        Is: Iterator<Item = pass::SubpassDesc<'a>>,
+        Id: Iterator<Item = pass::SubpassDependency>;
 
     /// Destroys a *render pass* created by this device.
     unsafe fn destroy_render_pass(&self, rp: B::RenderPass);
@@ -260,18 +259,14 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// accessed by a pipeline. The pipeline layout represents a sequence of descriptor sets with
     /// each having a specific layout. This sequence of layouts is used to determine the interface
     /// between shader stages and shader resources. Each pipeline is created using a pipeline layout.
-    unsafe fn create_pipeline_layout<IS, IR>(
+    unsafe fn create_pipeline_layout<'a, Is, Ic>(
         &self,
-        set_layouts: IS,
-        push_constant: IR,
+        set_layouts: Is,
+        push_constant: Ic,
     ) -> Result<B::PipelineLayout, OutOfMemory>
     where
-        IS: IntoIterator,
-        IS::Item: Borrow<B::DescriptorSetLayout>,
-        IS::IntoIter: ExactSizeIterator,
-        IR: IntoIterator,
-        IR::Item: Borrow<(pso::ShaderStageFlags, Range<u32>)>,
-        IR::IntoIter: ExactSizeIterator;
+        Is: Iterator<Item = &'a B::DescriptorSetLayout>,
+        Ic: Iterator<Item = (pso::ShaderStageFlags, Range<u32>)>;
 
     /// Destroy a pipeline layout object
     unsafe fn destroy_pipeline_layout(&self, layout: B::PipelineLayout);
@@ -289,15 +284,13 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     ) -> Result<Vec<u8>, OutOfMemory>;
 
     /// Merge a number of source pipeline caches into the target one.
-    unsafe fn merge_pipeline_caches<I>(
+    unsafe fn merge_pipeline_caches<'a, I>(
         &self,
-        target: &B::PipelineCache,
+        target: &mut B::PipelineCache,
         sources: I,
     ) -> Result<(), OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<B::PipelineCache>,
-        I::IntoIter: ExactSizeIterator;
+        I: Iterator<Item = &'a B::PipelineCache>;
 
     /// Destroy a pipeline cache object.
     unsafe fn destroy_pipeline_cache(&self, cache: B::PipelineCache);
@@ -317,22 +310,6 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         cache: Option<&B::PipelineCache>,
     ) -> Result<B::GraphicsPipeline, pso::CreationError>;
 
-    /// Create multiple graphics pipelines.
-    unsafe fn create_graphics_pipelines<'a, I>(
-        &self,
-        descs: I,
-        cache: Option<&B::PipelineCache>,
-    ) -> Vec<Result<B::GraphicsPipeline, pso::CreationError>>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<pso::GraphicsPipelineDesc<'a, B>>,
-    {
-        descs
-            .into_iter()
-            .map(|desc| self.create_graphics_pipeline(desc.borrow(), cache))
-            .collect()
-    }
-
     /// Destroy a graphics pipeline.
     ///
     /// The graphics pipeline shouldn't be destroyed before any submitted command buffer,
@@ -345,22 +322,6 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         desc: &pso::ComputePipelineDesc<'a, B>,
         cache: Option<&B::PipelineCache>,
     ) -> Result<B::ComputePipeline, pso::CreationError>;
-
-    /// Create compute pipelines.
-    unsafe fn create_compute_pipelines<'a, I>(
-        &self,
-        descs: I,
-        cache: Option<&B::PipelineCache>,
-    ) -> Vec<Result<B::ComputePipeline, pso::CreationError>>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<pso::ComputePipelineDesc<'a, B>>,
-    {
-        descs
-            .into_iter()
-            .map(|desc| self.create_compute_pipeline(desc.borrow(), cache))
-            .collect()
-    }
 
     /// Destroy a compute pipeline.
     ///
@@ -379,12 +340,11 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         extent: image::Extent,
     ) -> Result<B::Framebuffer, OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<B::ImageView>;
+        I: Iterator<Item = image::FramebufferAttachment>;
 
     /// Destroy a framebuffer.
     ///
-    /// The framebuffer shouldn't be destroy before any submitted command buffer,
+    /// The framebuffer shouldn't be destroyed before any submitted command buffer,
     /// which references the framebuffer, has finished execution.
     unsafe fn destroy_framebuffer(&self, buf: B::Framebuffer);
 
@@ -399,9 +359,9 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Create a new shader module from the `naga` module.
     unsafe fn create_shader_module_from_naga(
         &self,
-        module: naga::Module,
-    ) -> Result<B::ShaderModule, (ShaderError, naga::Module)> {
-        Err((ShaderError::Unsupported, module))
+        shader: NagaShader,
+    ) -> Result<B::ShaderModule, (ShaderError, NagaShader)> {
+        Err((ShaderError::Unsupported, shader))
     }
 
     /// Destroy a shader module module
@@ -416,6 +376,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         &self,
         size: u64,
         usage: buffer::Usage,
+        sparse: memory::SparseFlags,
     ) -> Result<B::Buffer, buffer::CreationError>;
 
     /// Get memory requirements for the buffer
@@ -449,6 +410,8 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Destroy a buffer view object
     unsafe fn destroy_buffer_view(&self, view: B::BufferView);
 
+    //TODO: add a list of supported formats for casting the views
+
     /// Create a new image object
     unsafe fn create_image(
         &self,
@@ -457,6 +420,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         format: format::Format,
         tiling: image::Tiling,
         usage: image::Usage,
+        sparse: memory::SparseFlags,
         view_caps: image::ViewCapabilities,
     ) -> Result<B::Image, image::CreationError>;
 
@@ -517,9 +481,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         flags: DescriptorPoolCreateFlags,
     ) -> Result<B::DescriptorPool, OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorRangeDesc>,
-        I::IntoIter: ExactSizeIterator;
+        I: Iterator<Item = pso::DescriptorRangeDesc>;
 
     /// Destroy a descriptor pool object
     ///
@@ -534,54 +496,47 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Each individual descriptor binding is specified by a descriptor type, a count (array size)
     /// of the number of descriptors in the binding, a set of shader stages that **can** access the
     /// binding, and (if using immutable samplers) an array of sampler descriptors.
-    unsafe fn create_descriptor_set_layout<I, J>(
+    unsafe fn create_descriptor_set_layout<'a, I, J>(
         &self,
         bindings: I,
         immutable_samplers: J,
     ) -> Result<B::DescriptorSetLayout, OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetLayoutBinding>,
-        J: IntoIterator,
-        J::Item: Borrow<B::Sampler>,
-        J::IntoIter: ExactSizeIterator;
+        I: Iterator<Item = pso::DescriptorSetLayoutBinding>,
+        J: Iterator<Item = &'a B::Sampler>;
 
     /// Destroy a descriptor set layout object
     unsafe fn destroy_descriptor_set_layout(&self, layout: B::DescriptorSetLayout);
 
-    /// Specifying the parameters of a descriptor set write operation
-    unsafe fn write_descriptor_sets<'a, I, J>(&self, write_iter: I)
+    /// Specifying the parameters of a descriptor set write operation.
+    unsafe fn write_descriptor_set<'a, I>(&self, op: pso::DescriptorSetWrite<'a, B, I>)
     where
-        I: IntoIterator<Item = pso::DescriptorSetWrite<'a, B, J>>,
-        J: IntoIterator,
-        J::Item: Borrow<pso::Descriptor<'a, B>>;
+        I: Iterator<Item = pso::Descriptor<'a, B>>;
 
-    /// Structure specifying a copy descriptor set operation
-    unsafe fn copy_descriptor_sets<'a, I>(&self, copy_iter: I)
-    where
-        I: IntoIterator,
-        I::Item: Borrow<pso::DescriptorSetCopy<'a, B>>,
-        I::IntoIter: ExactSizeIterator;
+    /// Structure specifying a copy descriptor set operation.
+    unsafe fn copy_descriptor_set<'a>(&self, op: pso::DescriptorSetCopy<'a, B>);
 
     /// Map a memory object into application address space
     ///
     /// Call `map_memory()` to retrieve a host virtual address pointer to a region of a mappable memory object
-    unsafe fn map_memory(&self, memory: &B::Memory, segment: Segment) -> Result<*mut u8, MapError>;
+    unsafe fn map_memory(
+        &self,
+        memory: &mut B::Memory,
+        segment: Segment,
+    ) -> Result<*mut u8, MapError>;
 
     /// Flush mapped memory ranges
     unsafe fn flush_mapped_memory_ranges<'a, I>(&self, ranges: I) -> Result<(), OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a B::Memory, Segment)>;
+        I: Iterator<Item = (&'a B::Memory, Segment)>;
 
     /// Invalidate ranges of non-coherent memory from the host caches
     unsafe fn invalidate_mapped_memory_ranges<'a, I>(&self, ranges: I) -> Result<(), OutOfMemory>
     where
-        I: IntoIterator,
-        I::Item: Borrow<(&'a B::Memory, Segment)>;
+        I: Iterator<Item = (&'a B::Memory, Segment)>;
 
     /// Unmap a memory object once host access to it is no longer needed by the application
-    unsafe fn unmap_memory(&self, memory: &B::Memory);
+    unsafe fn unmap_memory(&self, memory: &mut B::Memory);
 
     /// Create a new semaphore object.
     fn create_semaphore(&self) -> Result<B::Semaphore, OutOfMemory>;
@@ -596,7 +551,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     /// Fences have two states - signaled and unsignaled.
     ///
     /// A fence **can** be signaled as part of the execution of a
-    /// [queue submission][crate::queue::CommandQueue::submit] command.
+    /// [queue submission][crate::queue::Queue::submit] command.
     ///
     /// Fences **can** be unsignaled on the host with
     /// [`reset_fences`][Device::reset_fences].
@@ -613,22 +568,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     fn create_fence(&self, signaled: bool) -> Result<B::Fence, OutOfMemory>;
 
     /// Resets a given fence to its original, unsignaled state.
-    unsafe fn reset_fence(&self, fence: &B::Fence) -> Result<(), OutOfMemory> {
-        self.reset_fences(iter::once(fence))
-    }
-
-    /// Resets multiple fences to their original states.
-    unsafe fn reset_fences<I>(&self, fences: I) -> Result<(), OutOfMemory>
-    where
-        I: IntoIterator,
-        I::Item: Borrow<B::Fence>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        for fence in fences {
-            self.reset_fence(fence.borrow())?;
-        }
-        Ok(())
-    }
+    unsafe fn reset_fence(&self, fence: &mut B::Fence) -> Result<(), OutOfMemory>;
 
     /// Blocks until the given fence is signaled.
     /// Returns true if the fence was signaled before the timeout.
@@ -638,16 +578,14 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
 
     /// Blocks until all or one of the given fences are signaled.
     /// Returns true if fences were signaled before the timeout.
-    unsafe fn wait_for_fences<I>(
+    unsafe fn wait_for_fences<'a, I>(
         &self,
         fences: I,
         wait: WaitFor,
         timeout_ns: u64,
     ) -> Result<bool, WaitError>
     where
-        I: IntoIterator,
-        I::Item: Borrow<B::Fence>,
-        I::IntoIter: ExactSizeIterator,
+        I: Iterator<Item = &'a B::Fence>,
     {
         use std::{thread, time};
         fn to_ns(duration: time::Duration) -> u64 {
@@ -658,12 +596,12 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         match wait {
             WaitFor::All => {
                 for fence in fences {
-                    if !self.wait_for_fence(fence.borrow(), 0)? {
+                    if !self.wait_for_fence(fence, 0)? {
                         let elapsed_ns = to_ns(start.elapsed());
                         if elapsed_ns > timeout_ns {
                             return Ok(false);
                         }
-                        if !self.wait_for_fence(fence.borrow(), timeout_ns - elapsed_ns)? {
+                        if !self.wait_for_fence(fence, timeout_ns - elapsed_ns)? {
                             return Ok(false);
                         }
                     }
@@ -671,10 +609,10 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
                 Ok(true)
             }
             WaitFor::Any => {
-                let fences: Vec<_> = fences.into_iter().collect();
+                let fences: Vec<_> = fences.collect();
                 loop {
-                    for fence in &fences {
-                        if self.wait_for_fence(fence.borrow(), 0)? {
+                    for &fence in &fences {
+                        if self.wait_for_fence(fence, 0)? {
                             return Ok(true);
                         }
                     }
@@ -705,10 +643,10 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
     unsafe fn get_event_status(&self, event: &B::Event) -> Result<bool, WaitError>;
 
     /// Sets an event.
-    unsafe fn set_event(&self, event: &B::Event) -> Result<(), OutOfMemory>;
+    unsafe fn set_event(&self, event: &mut B::Event) -> Result<(), OutOfMemory>;
 
     /// Resets an event.
-    unsafe fn reset_event(&self, event: &B::Event) -> Result<(), OutOfMemory>;
+    unsafe fn reset_event(&self, event: &mut B::Event) -> Result<(), OutOfMemory>;
 
     /// Create a new query pool object
     ///
@@ -730,7 +668,7 @@ pub trait Device<B: Backend>: fmt::Debug + Any + Send + Sync {
         pool: &B::QueryPool,
         queries: Range<query::Id>,
         data: &mut [u8],
-        stride: buffer::Offset,
+        stride: buffer::Stride,
         flags: query::ResultFlags,
     ) -> Result<bool, WaitError>;
 

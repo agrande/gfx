@@ -1,14 +1,14 @@
-use crate::{Error, GlContainer};
+use crate::{Error, GlContainer, MAX_COLOR_ATTACHMENTS};
 use glow::HasContext;
-use hal::{Features, Hints, Limits};
+use hal::{DynamicStates, Features, Limits, PerformanceCaveats, PhysicalDeviceProperties};
 use std::{collections::HashSet, fmt, str};
 
 /// A version number for a specific component of an OpenGL implementation
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Version {
-    pub is_embedded: bool,
     pub major: u32,
     pub minor: u32,
+    pub is_embedded: bool,
     pub revision: Option<u32>,
     pub vendor_info: String,
 }
@@ -17,9 +17,9 @@ impl Version {
     /// Create a new OpenGL version number
     pub fn new(major: u32, minor: u32, revision: Option<u32>, vendor_info: String) -> Self {
         Version {
-            is_embedded: false,
             major: major,
             minor: minor,
+            is_embedded: false,
             revision: revision,
             vendor_info,
         }
@@ -27,9 +27,9 @@ impl Version {
     /// Create a new OpenGL ES version number
     pub fn new_embedded(major: u32, minor: u32, vendor_info: String) -> Self {
         Version {
-            is_embedded: true,
             major,
             minor,
+            is_embedded: true,
             revision: None,
             vendor_info,
         }
@@ -61,9 +61,9 @@ impl Version {
         let is_webgl = src.contains(webgl_sig);
         if is_webgl {
             return Ok(Version {
-                is_embedded: true,
                 major: 2,
                 minor: 0,
+                is_embedded: true,
                 revision: None,
                 vendor_info: "".to_string(),
             });
@@ -98,9 +98,9 @@ impl Version {
 
         match (major, minor, revision) {
             (Some(major), Some(minor), revision) => Ok(Version {
-                is_embedded: is_es,
                 major,
                 minor,
+                is_embedded: is_es,
                 revision,
                 vendor_info,
             }),
@@ -167,8 +167,8 @@ pub struct PlatformName {
 impl PlatformName {
     fn get(gl: &GlContainer) -> Self {
         PlatformName {
-            vendor: get_string(gl, glow::VENDOR).unwrap(),
-            renderer: get_string(gl, glow::RENDERER).unwrap(),
+            vendor: get_string(gl, glow::VENDOR).unwrap_or_default(),
+            renderer: get_string(gl, glow::RENDERER).unwrap_or_default(),
         }
     }
 }
@@ -204,6 +204,12 @@ pub struct PrivateCaps {
     pub depth_range_f64_precision: bool,
     /// Whether draw buffers are supported
     pub draw_buffers: bool,
+    /// Whether separate color masks per output buffer are supported.
+    pub per_slot_color_mask: bool,
+    /// Reading from textures into CPU memory is supported.
+    pub get_tex_image: bool,
+    /// Inserting memory barriers.
+    pub memory_barrier: bool,
 }
 
 /// OpenGL implementation information
@@ -309,7 +315,7 @@ impl Info {
 
     pub fn is_embedded_version_supported(&self, major: u32, minor: u32) -> bool {
         self.version.is_embedded
-            && self.version >= Version::new(major, minor, None, String::from(""))
+            && self.version >= Version::new_embedded(major, minor, String::from(""))
     }
 
     /// Returns `true` if the implementation supports the extension
@@ -343,7 +349,13 @@ impl Info {
 /// capabilities.
 pub(crate) fn query_all(
     gl: &GlContainer,
-) -> (Info, Features, LegacyFeatures, Hints, Limits, PrivateCaps) {
+) -> (
+    Info,
+    Features,
+    LegacyFeatures,
+    PhysicalDeviceProperties,
+    PrivateCaps,
+) {
     use self::Requirement::*;
     let info = Info::get(gl);
     let max_texture_size = get_usize(gl, glow::MAX_TEXTURE_SIZE).unwrap_or(64) as u32;
@@ -376,7 +388,9 @@ pub(crate) fn query_all(
         min_storage_buffer_offset_alignment,
         framebuffer_color_sample_counts: max_samples_mask,
         non_coherent_atom_size: 1,
-        max_color_attachments: get_usize(gl, glow::MAX_COLOR_ATTACHMENTS).unwrap_or(1),
+        max_color_attachments: get_usize(gl, glow::MAX_COLOR_ATTACHMENTS)
+            .unwrap_or(1)
+            .min(MAX_COLOR_ATTACHMENTS),
         ..Limits::default()
     };
 
@@ -388,7 +402,10 @@ pub(crate) fn query_all(
         limits.max_viewports = get_usize(gl, glow::MAX_VIEWPORTS).unwrap_or(0);
     }
 
-    if info.is_supported(&[Core(4, 3), Ext("GL_ARB_compute_shader")]) {
+    //TODO: technically compute is exposed in Es(3, 1), but GLES requires 3.2
+    // for any storage buffers. We need to investigate if this requirement
+    // can be lowered.
+    if info.is_supported(&[Core(4, 3), Es(3, 2), Ext("GL_ARB_compute_shader")]) {
         for (i, (count, size)) in limits
             .max_compute_work_group_count
             .iter_mut()
@@ -414,7 +431,7 @@ pub(crate) fn query_all(
     ]) {
         features |= Features::SAMPLER_ANISOTROPY;
     }
-    if info.is_supported(&[Core(4, 2)]) {
+    if info.is_supported(&[Core(4, 2), Es(3, 1)]) {
         legacy |= LegacyFeatures::EXPLICIT_LAYOUTS_IN_SHADER;
     }
     if info.is_supported(&[Core(3, 3), Es(3, 0), Ext("GL_ARB_instanced_arrays")]) {
@@ -489,11 +506,17 @@ pub(crate) fn query_all(
         legacy |= LegacyFeatures::INSTANCED_ATTRIBUTE_BINDING;
     }
 
-    let mut hints = Hints::empty();
-    if info.is_supported(&[Core(4, 2)]) {
-        // TODO: extension
-        hints |= Hints::BASE_VERTEX_INSTANCE_DRAWING;
+    let mut performance_caveats = PerformanceCaveats::empty();
+    //TODO: extension
+    if !info.is_supported(&[Core(4, 2)]) {
+        performance_caveats |= PerformanceCaveats::BASE_VERTEX_INSTANCE_DRAWING;
     }
+    let properties = PhysicalDeviceProperties {
+        limits,
+        performance_caveats,
+        dynamic_pipeline_states: DynamicStates::all(),
+        ..PhysicalDeviceProperties::default()
+    };
 
     let buffer_storage = info.is_supported(&[
         Core(4, 4),
@@ -519,9 +542,12 @@ pub(crate) fn query_all(
         emulate_map,
         depth_range_f64_precision: !info.version.is_embedded, // TODO
         draw_buffers: info.is_supported(&[Core(2, 0), Es(3, 0)]),
+        per_slot_color_mask: info.is_supported(&[Core(3, 0)]),
+        get_tex_image: !info.version.is_embedded,
+        memory_barrier: info.is_supported(&[Core(4, 2), Es(3, 1)]),
     };
 
-    (info, features, legacy, hints, limits, private)
+    (info, features, legacy, properties, private)
 }
 
 #[cfg(test)]

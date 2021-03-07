@@ -10,6 +10,9 @@ use crate::{device::OutOfMemory, format::Format};
 /// An offset inside a buffer, in bytes.
 pub type Offset = u64;
 
+/// An stride between elements inside a buffer, in bytes.
+pub type Stride = u32;
+
 /// A subrange of the buffer.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -82,6 +85,21 @@ bitflags!(
         const VERTEX = 0x80;
         ///
         const INDIRECT = 0x100;
+    }
+);
+
+bitflags!(
+    /// Buffer create flags.
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct CreateFlags: u32 {
+        /// Specifies the view will be backed using sparse memory binding.
+        const SPARSE_BINDING = 0x0000_0001;
+        /// Specifies the view can be partially backed with sparse memory binding.
+        /// Must have `SPARSE_BINDING` enabled.
+        const SPARSE_RESIDENCY = 0x0000_0002;
+        /// Specifies the view will be backed using sparse memory binding with memory bindings that
+        /// might alias other data. Must have `SPARSE_BINDING` enabled.
+        const SPARSE_ALIASED = 0x0000_0004;
     }
 );
 

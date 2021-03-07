@@ -27,7 +27,9 @@ extern crate log;
 
 use std::{
     cell::Cell,
+    collections::HashMap,
     fmt,
+    hash::BuildHasherDefault,
     ops::{Deref, Range},
     sync::{Arc, Weak},
     thread,
@@ -59,12 +61,14 @@ pub use glow::Context as GlContext;
 use glow::HasContext;
 
 type ColorSlot = u8;
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<fxhash::FxHasher>>;
 
 // we can support more samplers if not every one of them is used at a time,
 // but it probably doesn't worth it.
 const MAX_SAMPLERS: usize = 16;
 //TODO: has to be within glow::MAX_COMBINED_TEXTURE_IMAGE_UNITS
 const MAX_TEXTURE_SLOTS: usize = 16;
+const MAX_COLOR_ATTACHMENTS: usize = 16;
 
 struct GlContainer {
     context: GlContext,
@@ -88,7 +92,7 @@ impl hal::Backend for Backend {
     type Surface = Surface;
 
     type QueueFamily = QueueFamily;
-    type CommandQueue = queue::CommandQueue;
+    type Queue = queue::Queue;
     type CommandBuffer = command::CommandBuffer;
 
     type Memory = native::Memory;
@@ -96,7 +100,7 @@ impl hal::Backend for Backend {
 
     type ShaderModule = native::ShaderModule;
     type RenderPass = native::RenderPass;
-    type Framebuffer = native::FrameBuffer;
+    type Framebuffer = native::Framebuffer;
 
     type Buffer = native::Buffer;
     type BufferView = native::BufferView;
@@ -202,8 +206,7 @@ struct Share {
     info: Info,
     supported_features: hal::Features,
     legacy_features: info::LegacyFeatures,
-    hints: hal::Hints,
-    limits: hal::Limits,
+    public_caps: hal::PhysicalDeviceProperties,
     private_caps: info::PrivateCaps,
     // Indicates if there is an active logical device.
     open: Cell<bool>,
@@ -353,7 +356,7 @@ impl PhysicalDevice {
     fn new_adapter(context: GlContext) -> adapter::Adapter<Backend> {
         let gl = GlContainer { context };
         // query information
-        let (info, supported_features, legacy_features, hints, limits, private_caps) =
+        let (info, supported_features, legacy_features, public_caps, private_caps) =
             info::query_all(&gl);
         info!("Vendor: {:?}", info.platform_name.vendor);
         info!("Renderer: {:?}", info.platform_name.renderer);
@@ -361,6 +364,7 @@ impl PhysicalDevice {
         info!("Shading Language: {:?}", info.shading_language);
         info!("Supported Features: {:?}", supported_features);
         info!("Legacy Features: {:?}", legacy_features);
+        debug!("Public capabilities: {:#?}", public_caps);
         debug!("Private capabilities: {:#?}", private_caps);
         debug!("Loaded Extensions:");
         for extension in info.extensions.iter() {
@@ -430,8 +434,7 @@ impl PhysicalDevice {
             info,
             supported_features,
             legacy_features,
-            hints,
-            limits,
+            public_caps,
             private_caps,
             open: Cell::new(false),
             memory_types,
@@ -541,6 +544,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         let gl = &self.0.context;
 
         if cfg!(debug_assertions) && !cfg!(target_arch = "wasm32") && gl.supports_debug() {
+            info!("Debug output is enabled");
             gl.enable(glow::DEBUG_OUTPUT);
             gl.debug_message_callback(debug_message_callback);
         }
@@ -570,11 +574,11 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         Ok(adapter::Gpu {
             device: Device::new(self.0.clone(), requested_features),
             queue_groups: families
-                .into_iter()
+                .iter()
                 .map(|&(_family, priorities)| {
                     assert_eq!(priorities.len(), 1);
                     let mut family = q::QueueGroup::new(q::QueueFamilyId(0));
-                    let queue = queue::CommandQueue::new(&self.0, requested_features, vao);
+                    let queue = queue::Queue::new(&self.0, requested_features, vao);
                     family.add_queue(queue);
                     family
                 })
@@ -583,14 +587,13 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
     }
 
     fn format_properties(&self, _: Option<hal::format::Format>) -> hal::format::Properties {
-        use hal::format::BufferFeature;
-        use hal::format::ImageFeature;
+        use hal::format::{BufferFeature as Bf, ImageFeature as If};
 
         // TODO: These are for show
         hal::format::Properties {
-            linear_tiling: ImageFeature::SAMPLED,
-            optimal_tiling: ImageFeature::SAMPLED,
-            buffer_features: BufferFeature::VERTEX,
+            linear_tiling: If::TRANSFER_SRC | If::TRANSFER_DST | If::empty(),
+            optimal_tiling: If::TRANSFER_SRC | If::TRANSFER_DST | If::SAMPLED,
+            buffer_features: Bf::VERTEX,
         }
     }
 
@@ -641,12 +644,8 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         self.0.supported_features
     }
 
-    fn hints(&self) -> hal::Hints {
-        self.0.hints
-    }
-
-    fn limits(&self) -> hal::Limits {
-        self.0.limits
+    fn properties(&self) -> hal::PhysicalDeviceProperties {
+        self.0.public_caps
     }
 }
 

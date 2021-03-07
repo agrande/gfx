@@ -36,14 +36,14 @@
 //!
 //! # let mut surface: empty::Surface = return;
 //! # let device: empty::Device = return;
-//! # let mut present_queue: empty::CommandQueue = return;
+//! # let mut present_queue: empty::Queue = return;
 //! # unsafe {
-//! let render_semaphore = device.create_semaphore().unwrap();
+//! let mut render_semaphore = device.create_semaphore().unwrap();
 //!
 //! let (frame, suboptimal) = surface.acquire_image(!0).unwrap();
 //! // render the scene..
 //! // `render_semaphore` will be signalled once rendering has been finished
-//! present_queue.present(&mut surface, frame, Some(&render_semaphore));
+//! present_queue.present(&mut surface, frame, Some(&mut render_semaphore));
 //! # }}
 //! ```
 //!
@@ -335,6 +335,15 @@ impl SwapchainConfig {
             image_count,
             image_layers: 1,
             image_usage: DEFAULT_USAGE,
+        }
+    }
+
+    /// Return the framebuffer attachment corresponding to the swapchain image views.
+    pub fn framebuffer_attachment(&self) -> image::FramebufferAttachment {
+        image::FramebufferAttachment {
+            usage: self.image_usage,
+            view_caps: image::ViewCapabilities::empty(),
+            format: self.format,
         }
     }
 

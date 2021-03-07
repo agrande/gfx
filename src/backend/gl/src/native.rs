@@ -6,9 +6,7 @@ use hal::{
     pass, pso, window as w,
 };
 
-use parking_lot::Mutex;
-
-use std::{borrow::Borrow, cell::Cell, ops::Range, sync::Arc};
+use std::{borrow::Borrow, fmt, ops::Range, sync::Arc};
 
 pub type TextureTarget = u32;
 pub type TextureFormat = u32;
@@ -20,6 +18,7 @@ pub type RawBuffer = <GlContext as glow::HasContext>::Buffer;
 pub type Shader = <GlContext as glow::HasContext>::Shader;
 pub type Program = <GlContext as glow::HasContext>::Program;
 pub type Renderbuffer = <GlContext as glow::HasContext>::Renderbuffer;
+pub type RawFramebuffer = <GlContext as glow::HasContext>::Framebuffer;
 pub type Texture = <GlContext as glow::HasContext>::Texture;
 pub type Sampler = <GlContext as glow::HasContext>::Sampler;
 // TODO: UniformLocation was copy in glow 0.3, but in 0.4 it isn't. Wrap it in a Starc for now
@@ -27,11 +26,9 @@ pub type Sampler = <GlContext as glow::HasContext>::Sampler;
 pub type UniformLocation = crate::Starc<<GlContext as glow::HasContext>::UniformLocation>;
 pub type DescriptorSetLayout = Arc<Vec<pso::DescriptorSetLayoutBinding>>;
 
-pub type RawFrameBuffer = <GlContext as glow::HasContext>::Framebuffer;
-
 #[derive(Clone, Debug)]
-pub struct FrameBuffer {
-    pub(crate) fbos: Vec<Option<RawFrameBuffer>>,
+pub struct Framebuffer {
+    pub(crate) raw: RawFramebuffer,
 }
 
 #[derive(Debug)]
@@ -49,9 +46,9 @@ pub enum Buffer {
 impl Buffer {
     // Asserts that the buffer is bound and returns the raw gl buffer along with its sub-range.
     pub(crate) fn as_bound(&self) -> (RawBuffer, Range<u64>) {
-        match self {
+        match *self {
             Buffer::Unbound { .. } => panic!("Expected bound buffer!"),
-            Buffer::Bound { buffer, range, .. } => (*buffer, range.clone()),
+            Buffer::Bound { buffer, ref range } => (buffer, range.clone()),
         }
     }
 }
@@ -59,14 +56,12 @@ impl Buffer {
 #[derive(Debug)]
 pub struct BufferView;
 
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum FenceInner {
+#[derive(Debug)]
+pub enum Fence {
     Idle { signaled: bool },
-    Pending(Option<<GlContext as glow::HasContext>::Fence>),
+    Pending(<GlContext as glow::HasContext>::Fence),
 }
 
-#[derive(Debug)]
-pub struct Fence(pub(crate) Cell<FenceInner>);
 unsafe impl Send for Fence {}
 unsafe impl Sync for Fence {}
 
@@ -168,6 +163,15 @@ pub enum ImageView {
     },
 }
 
+impl ImageView {
+    pub(crate) fn aspects(&self) -> format::Aspects {
+        match *self {
+            ImageView::Renderbuffer { aspects, .. } => aspects,
+            ImageView::Texture { ref sub, .. } => sub.aspects,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SwapchainImage {
     pub image: Image,
@@ -218,7 +222,7 @@ impl SwapchainImage {
             },
             view: ImageView::Renderbuffer {
                 raw: renderbuffer,
-                aspects: format::Aspects::empty(),
+                aspects: format::Aspects::COLOR,
             },
         }
     }
@@ -241,26 +245,26 @@ pub(crate) enum DescSetBindings {
 pub struct DescriptorSet {
     pub(crate) layout: DescriptorSetLayout,
     //TODO: use `UnsafeCell` instead
-    pub(crate) bindings: Arc<Mutex<Vec<DescSetBindings>>>,
+    pub(crate) bindings: Vec<DescSetBindings>,
 }
 
 #[derive(Debug)]
 pub struct DescriptorPool {}
 
 impl pso::DescriptorPool<Backend> for DescriptorPool {
-    unsafe fn allocate_set(
+    unsafe fn allocate_one(
         &mut self,
         layout: &DescriptorSetLayout,
     ) -> Result<DescriptorSet, pso::AllocationError> {
         Ok(DescriptorSet {
             layout: Arc::clone(layout),
-            bindings: Arc::new(Mutex::new(Vec::new())),
+            bindings: Vec::new(),
         })
     }
 
     unsafe fn free<I>(&mut self, descriptor_sets: I)
     where
-        I: IntoIterator<Item = DescriptorSet>,
+        I: Iterator<Item = DescriptorSet>,
     {
         for _set in descriptor_sets {
             // Poof!  Does nothing, because OpenGL doesn't have a meaningful concept of a `DescriptorSet`.
@@ -272,12 +276,17 @@ impl pso::DescriptorPool<Backend> for DescriptorPool {
     }
 }
 
-#[derive(Debug)]
-pub enum ShaderModule {
-    Raw(Shader),
-    Spirv(Vec<u32>),
-    #[cfg(feature = "naga")]
-    Naga(naga::Module, Vec<u32>),
+pub struct ShaderModule {
+    pub(crate) prefer_naga: bool,
+    #[cfg(feature = "cross")]
+    pub(crate) spv: Vec<u32>,
+    pub(crate) naga: Option<hal::device::NagaShader>,
+}
+
+impl fmt::Debug for ShaderModule {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "ShaderModule()")
+    }
 }
 
 #[derive(Debug)]
@@ -289,7 +298,7 @@ pub struct Memory {
     /// Allocation size
     pub(crate) size: u64,
     pub(crate) map_flags: u32,
-    pub(crate) emulate_map_allocation: Cell<Option<*mut u8>>,
+    pub(crate) emulate_map_allocation: Option<*mut u8>,
 }
 
 unsafe impl Send for Memory {}
@@ -309,7 +318,7 @@ pub struct SubpassDesc {
 
 impl SubpassDesc {
     /// Check if an attachment is used by this sub-pass.
-    pub(crate) fn attachment_using(&self, at_id: pass::AttachmentId) -> Option<u32> {
+    pub(crate) fn _attachment_using(&self, at_id: pass::AttachmentId) -> Option<u32> {
         if self.depth_stencil == Some(at_id) {
             Some(glow::DEPTH_STENCIL_ATTACHMENT)
         } else {

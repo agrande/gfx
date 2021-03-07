@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use crate::{GlContext, MAX_SAMPLERS, MAX_TEXTURE_SLOTS};
+use crate::{GlContext, MAX_COLOR_ATTACHMENTS, MAX_SAMPLERS, MAX_TEXTURE_SLOTS};
 
 use hal::{
     self, buffer, command,
@@ -14,9 +14,10 @@ use crate::{
     Backend, ColorSlot,
 };
 
+use arrayvec::ArrayVec;
 use parking_lot::Mutex;
 
-use std::{borrow::Borrow, iter, mem, ops::Range, slice, sync::Arc};
+use std::{iter, mem, ops::Range, slice, sync::Arc};
 
 // Command buffer implementation details:
 //
@@ -99,14 +100,15 @@ pub enum Command {
     ClearBufferDepthStencil(Option<pso::DepthValue>, Option<pso::StencilValue>),
     /// Clear the currently bound texture with the given color.
     ClearTexture([f32; 4]),
+    FillBuffer(n::RawBuffer, Range<buffer::Offset>, u32),
 
-    /// Set list of color attachments for drawing.
-    /// The buffer slice contains a list of `GLenum`.
-    DrawBuffers(BufferSlice),
-
-    BindFrameBuffer(FrameBufferTarget, Option<n::RawFrameBuffer>),
-    BindTargetView(FrameBufferTarget, AttachmentPoint, n::ImageView),
-    SetDrawColorBuffers(usize),
+    BindFramebuffer {
+        target: FrameBufferTarget,
+        framebuffer: n::RawFramebuffer,
+        colors: ArrayVec<[n::ImageView; MAX_COLOR_ATTACHMENTS]>,
+        depth_stencil: Option<n::ImageView>,
+    },
+    SetDrawColorBuffers(ArrayVec<[u8; MAX_COLOR_ATTACHMENTS]>),
     SetPatchSize(i32),
     BindProgram(<GlContext as glow::HasContext>::Program),
     SetBlend(Option<pso::BlendState>),
@@ -154,24 +156,24 @@ pub enum Command {
     SetDepthMask(bool),
     SetStencilMask(pso::StencilValue),
     SetStencilMaskSeparate(pso::Sided<pso::StencilValue>),
+
+    MemoryBarrier(u32),
 }
 
 pub type FrameBufferTarget = u32;
-pub type AttachmentPoint = u32;
 pub type DrawBuffer = u32;
 
 #[derive(Clone, Debug)]
-struct AttachmentClear {
-    subpass_id: pass::SubpassId,
-    index: u32,
-    value: command::ClearValue,
+struct AttachmentInfo {
+    //subpass_id: pass::SubpassId,
+    color_index: Option<u8>,
+    clear_value: command::ClearValue,
 }
 
 #[derive(Debug)]
 pub struct RenderPassCache {
     render_pass: n::RenderPass,
-    framebuffer: n::FrameBuffer,
-    attachment_clears: Vec<Option<AttachmentClear>>,
+    attachments: Vec<AttachmentInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -192,7 +194,7 @@ struct Cache {
     // Blend color.
     blend_color: Option<pso::ColorValue>,
     ///
-    framebuffer: Option<(FrameBufferTarget, n::RawFrameBuffer)>,
+    framebuffer: Option<(FrameBufferTarget, n::RawFramebuffer)>,
     ///
     // Indicates that invalid commands have been recorded.
     error_state: bool,
@@ -351,7 +353,7 @@ pub struct CommandBuffer {
     pub(crate) data: CommandStorage,
     individual_reset: bool,
 
-    fbo: Option<n::RawFrameBuffer>,
+    fbo: Option<n::RawFramebuffer>,
     /// The framebuffer to use for rendering to the main targets (0 by default).
     ///
     /// Use this to set the framebuffer that will be used for the screen display targets created
@@ -361,7 +363,7 @@ pub struct CommandBuffer {
     ///
     /// This framebuffer must exist and be configured correctly (with renderbuffer attachments,
     /// etc.) so that rendering to it can occur immediately.
-    pub display_fb: Option<n::RawFrameBuffer>,
+    pub display_fb: Option<n::Framebuffer>,
     cache: Cache,
 
     pass_cache: Option<RenderPassCache>,
@@ -374,7 +376,7 @@ pub struct CommandBuffer {
 
 impl CommandBuffer {
     pub(crate) fn new(
-        fbo: Option<n::RawFrameBuffer>,
+        fbo: Option<n::RawFramebuffer>,
         limits: Limits,
         memory: Arc<Mutex<BufferMemory>>,
         legacy_featues: info::LegacyFeatures,
@@ -520,142 +522,106 @@ impl CommandBuffer {
 
         // See `begin_renderpass_cache` for clearing strategy
 
-        self.data.push_cmd(Command::BindFrameBuffer(
-            glow::DRAW_FRAMEBUFFER,
-            state.framebuffer.fbos[self.cur_subpass as usize],
-        ));
-
         // Bind draw buffers for mapping color output locations with
         // framebuffer attachments.
-        let draw_buffers = if state.framebuffer.fbos[self.cur_subpass as usize].is_none() {
-            // The default framebuffer is created by the driver
-            // We don't have influence on its layout and we treat it as single image.
-            //
-            // TODO: handle case where we don't do double-buffering?
-            vec![glow::BACK_LEFT]
-        } else {
-            subpass
-                .color_attachments
-                .iter()
-                .enumerate()
-                .map(|(index, _)| glow::COLOR_ATTACHMENT0 + index as u32)
-                .collect::<Vec<_>>()
-        };
+        let attachment_indices = subpass
+            .color_attachments
+            .iter()
+            .map(|&index| state.attachments[index].color_index.unwrap())
+            .collect();
+        self.data
+            .push_cmd(Command::SetDrawColorBuffers(attachment_indices));
+        self.data
+            .push_cmd(Command::SetColorMask(None, pso::ColorMask::ALL));
 
-        // Record commands
-        let draw_buffers = self.data.add(&draw_buffers);
-        self.data.push_cmd(Command::DrawBuffers(draw_buffers));
-
-        let clears = state
+        for (rat, info) in state
             .render_pass
             .attachments
             .iter()
-            .zip(state.attachment_clears.iter());
-        for (attachment, clear) in clears {
-            let clear = match clear {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // Check if the attachment is first used in this subpass
-            if clear.subpass_id != self.cur_subpass {
-                continue;
-            }
+            .zip(state.attachments.iter())
+        {
+            //TODO: check if the subpass is one where we need this clear
 
             // View format needs to be known at this point.
             // All attachments specified in the renderpass must have a valid,
             // matching image view bound in the framebuffer.
-            let view_format = attachment.format.unwrap();
+            let view_format = rat.format.unwrap();
 
-            // Clear color target
-            if view_format.is_color() {
-                assert!(
-                    clear.index >= glow::COLOR_ATTACHMENT0
-                        && clear.index <= glow::COLOR_ATTACHMENT31
-                );
-                assert_eq!(attachment.ops.load, pass::AttachmentLoadOp::Clear);
+            match info.color_index {
+                // Clear color target
+                Some(draw_color_index) => {
+                    if rat.ops.load != pass::AttachmentLoadOp::Clear {
+                        continue;
+                    }
+                    let channel = view_format.base_format().1;
+                    let draw_color_index = draw_color_index as u32;
 
-                let channel = view_format.base_format().1;
-                let index = clear.index - glow::COLOR_ATTACHMENT0;
-
-                // Temporarily reset color mask if it was not ColorMask::ALL
-                let blend_target = self.cache.blend_targets.get(index as usize);
-                let color_mask = blend_target
-                    .map(Option::as_ref)
-                    .flatten()
-                    .map(|blend_target| blend_target.mask)
-                    .filter(|mask| *mask != pso::ColorMask::ALL);
-                if color_mask.is_some() || blend_target.is_none() {
-                    self.data
-                        .push_cmd(Command::SetColorMask(Some(index), pso::ColorMask::ALL));
+                    self.data.push_cmd(match channel {
+                        ChannelType::Unorm
+                        | ChannelType::Snorm
+                        | ChannelType::Ufloat
+                        | ChannelType::Sfloat
+                        | ChannelType::Srgb
+                        | ChannelType::Uscaled
+                        | ChannelType::Sscaled => {
+                            Command::ClearBufferColorF(draw_color_index, unsafe {
+                                info.clear_value.color.float32
+                            })
+                        }
+                        ChannelType::Uint => Command::ClearBufferColorU(draw_color_index, unsafe {
+                            info.clear_value.color.uint32
+                        }),
+                        ChannelType::Sint => Command::ClearBufferColorI(draw_color_index, unsafe {
+                            info.clear_value.color.sint32
+                        }),
+                    });
                 }
-
-                self.data.push_cmd(match channel {
-                    ChannelType::Unorm
-                    | ChannelType::Snorm
-                    | ChannelType::Ufloat
-                    | ChannelType::Sfloat
-                    | ChannelType::Srgb
-                    | ChannelType::Uscaled
-                    | ChannelType::Sscaled => {
-                        Command::ClearBufferColorF(index, unsafe { clear.value.color.float32 })
-                    }
-                    ChannelType::Uint => {
-                        Command::ClearBufferColorU(index, unsafe { clear.value.color.uint32 })
-                    }
-                    ChannelType::Sint => {
-                        Command::ClearBufferColorI(index, unsafe { clear.value.color.sint32 })
-                    }
-                });
-
-                if let Some(mask) = color_mask {
-                    self.data.push_cmd(Command::SetColorMask(Some(index), mask));
-                }
-            } else {
                 // Clear depth-stencil target
-                let depth = if view_format.is_depth()
-                    && attachment.ops.load == pass::AttachmentLoadOp::Clear
-                {
-                    Some(unsafe { clear.value.depth_stencil.depth })
-                } else {
-                    None
-                };
+                None => {
+                    let depth = if view_format.is_depth()
+                        && rat.ops.load == pass::AttachmentLoadOp::Clear
+                    {
+                        Some(unsafe { info.clear_value.depth_stencil.depth })
+                    } else {
+                        None
+                    };
 
-                // Only reset depth mask if it was non writable
-                let depth_mask = self.cache.depth_mask.filter(|mask| !mask);
+                    // Only reset depth mask if it was non writable
+                    let depth_mask = self.cache.depth_mask.filter(|mask| !mask);
 
-                let stencil = if view_format.is_stencil()
-                    && attachment.stencil_ops.load == pass::AttachmentLoadOp::Clear
-                {
-                    Some(unsafe { clear.value.depth_stencil.stencil })
-                } else {
-                    None
-                };
+                    let stencil = if view_format.is_stencil()
+                        && rat.stencil_ops.load == pass::AttachmentLoadOp::Clear
+                    {
+                        Some(unsafe { info.clear_value.depth_stencil.stencil })
+                    } else {
+                        None
+                    };
 
-                let stencil_mask = self
-                    .cache
-                    .stencil_mask
-                    .filter(|mask| mask.front != !0 || mask.back != !0);
+                    let stencil_mask = self
+                        .cache
+                        .stencil_mask
+                        .filter(|mask| mask.front != !0 || mask.back != !0);
 
-                // Temporarily reset masks as they may prevent buffer clear in gl
-                if depth_mask.is_some() || self.cache.depth_mask.is_none() {
-                    self.data.push_cmd(Command::SetDepthMask(true));
-                }
-                if stencil_mask.is_some() || self.cache.stencil_mask.is_none() {
-                    self.data.push_cmd(Command::SetStencilMask(!0));
-                }
+                    // Temporarily reset masks as they may prevent buffer clear in gl
+                    if depth_mask.is_some() || self.cache.depth_mask.is_none() {
+                        self.data.push_cmd(Command::SetDepthMask(true));
+                    }
+                    if stencil_mask.is_some() || self.cache.stencil_mask.is_none() {
+                        self.data.push_cmd(Command::SetStencilMask(!0));
+                    }
 
-                if depth.is_some() || stencil.is_some() {
-                    self.data
-                        .push_cmd(Command::ClearBufferDepthStencil(depth, stencil));
-                }
+                    if depth.is_some() || stencil.is_some() {
+                        self.data
+                            .push_cmd(Command::ClearBufferDepthStencil(depth, stencil));
+                    }
 
-                // Restore masks if they were reset
-                if let Some(mask) = depth_mask {
-                    self.data.push_cmd(Command::SetDepthMask(mask));
-                }
-                if let Some(mask) = stencil_mask {
-                    self.data.push_cmd(Command::SetStencilMaskSeparate(mask));
+                    // Restore masks if they were reset
+                    if let Some(mask) = depth_mask {
+                        self.data.push_cmd(Command::SetDepthMask(mask));
+                    }
+                    if let Some(mask) = stencil_mask {
+                        self.data.push_cmd(Command::SetStencilMaskSeparate(mask));
+                    }
                 }
             }
         }
@@ -685,19 +651,17 @@ impl CommandBuffer {
         }
     }
 
-    fn bind_descriptor_sets<I, J>(
+    fn bind_descriptor_sets<'a, I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
         sets: I,
-        offsets: J,
+        mut offsets: J,
     ) where
-        I: IntoIterator,
-        I::Item: Borrow<n::DescriptorSet>,
-        J: IntoIterator,
-        J::Item: Borrow<command::DescriptorSetOffset>,
+        I: Iterator<Item = &'a n::DescriptorSet>,
+        J: Iterator<Item = command::DescriptorSetOffset>,
     {
-        if let Some(_) = offsets.into_iter().next() {
+        if let Some(_) = offsets.next() {
             warn!("Dynamic offsets are not supported yet");
         }
 
@@ -705,9 +669,9 @@ impl CommandBuffer {
         let mut dirty_samplers = 0u32;
         let mut set = first_set as usize;
         for desc_set in sets {
-            let desc_set = desc_set.borrow();
-            let bindings = desc_set.bindings.lock();
-            for (binding_layout, new_binding) in desc_set.layout.iter().zip(bindings.iter()) {
+            for (binding_layout, new_binding) in
+                desc_set.layout.iter().zip(desc_set.bindings.iter())
+            {
                 let binding = layout.sets[set].bindings[binding_layout.binding as usize] as u32;
                 match *new_binding {
                     n::DescSetBindings::Buffer {
@@ -788,32 +752,66 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         &mut self,
         _stages: Range<pso::PipelineStage>,
         _dependencies: memory::Dependencies,
-        _barriers: T,
+        barriers: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<memory::Barrier<'a, Backend>>,
+        T: Iterator<Item = memory::Barrier<'a, Backend>>,
     {
-        // TODO
+        //TODO: this needs to be much more detailed. Problem is that the affected
+        // resources by a barrier have to be bound to specific slots, so, for example,
+        // doing a `set_graphics_pipeline` followed by `pipeline_barrier` may need
+        // the vertex bindings to be reinstated.
+        let mut mask = 0;
+
+        for barrier in barriers {
+            match barrier {
+                memory::Barrier::AllBuffers(access) => {
+                    if access.start.contains(buffer::Access::SHADER_WRITE) {
+                        mask |= glow::SHADER_STORAGE_BARRIER_BIT;
+                    }
+                }
+                memory::Barrier::Buffer { states, .. } => {
+                    if states.start.contains(buffer::Access::SHADER_WRITE) {
+                        mask |= glow::SHADER_STORAGE_BARRIER_BIT;
+                    }
+                }
+                memory::Barrier::AllImages(access) => {
+                    if access.start.contains(image::Access::SHADER_WRITE) {
+                        mask |= glow::SHADER_IMAGE_ACCESS_BARRIER_BIT;
+                    }
+                }
+                memory::Barrier::Image { states, .. } => {
+                    if states.start.0.contains(image::Access::SHADER_WRITE) {
+                        mask |= glow::SHADER_IMAGE_ACCESS_BARRIER_BIT;
+                    }
+                }
+            }
+        }
+
+        if mask != 0 {
+            self.data.push_cmd(Command::MemoryBarrier(mask));
+        }
     }
 
-    unsafe fn fill_buffer(&mut self, _buffer: &n::Buffer, _range: buffer::SubRange, _data: u32) {
-        unimplemented!()
+    unsafe fn fill_buffer(&mut self, buffer: &n::Buffer, sub: buffer::SubRange, data: u32) {
+        let (raw_buffer, parent_range) = buffer.as_bound();
+        let range = crate::resolve_sub_range(&sub, parent_range);
+        self.data
+            .push_cmd(Command::FillBuffer(raw_buffer, range, data));
     }
 
     unsafe fn update_buffer(&mut self, _buffer: &n::Buffer, _offset: buffer::Offset, _data: &[u8]) {
         unimplemented!()
     }
 
-    unsafe fn begin_render_pass<T>(
+    unsafe fn begin_render_pass<'a, T>(
         &mut self,
         render_pass: &n::RenderPass,
-        framebuffer: &n::FrameBuffer,
+        framebuffer: &n::Framebuffer,
         _render_area: pso::Rect,
-        clear_values: T,
+        attachment_infos: T,
         _first_subpass: command::SubpassContents,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::ClearValue>,
+        T: Iterator<Item = command::RenderAttachmentInfo<'a, Backend>>,
     {
         // TODO: load ops: clearing strategy
         //  1.  < GL 3.0 / GL ES 2.0: glClear, only single color attachment?
@@ -830,39 +828,38 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         //  >= GL 4.5: Invalidate framebuffer attachment when store op is `DONT_CARE`.
 
         // 2./3.
-        let mut clear_values_iter = clear_values.into_iter();
-        let attachment_clears = render_pass
-            .attachments
-            .iter()
-            .enumerate()
-            .map(|(id, attachment)| {
-                let cv = if attachment.has_clears() {
-                    clear_values_iter.next().unwrap()
-                } else {
-                    return None;
-                };
+        let mut attachments = Vec::new();
+        let mut colors = ArrayVec::new();
+        let mut depth_stencil = None;
 
-                let (subpass, index) = render_pass
-                    .subpasses
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, sp)| {
-                        let index = sp.attachment_using(id)?;
-                        Some((i, index))
-                    })
-                    .next()?;
-                Some(AttachmentClear {
-                    subpass_id: subpass as pass::SubpassId,
-                    index,
-                    value: *cv.borrow(),
-                })
+        for info in attachment_infos {
+            let view = info.image_view.clone();
+            let aspects = view.aspects();
+            let color_index = if aspects.contains(Aspects::COLOR) {
+                colors.push(view);
+                Some(colors.len() as u8 - 1)
+            } else {
+                depth_stencil = Some(view);
+                None
+            };
+            attachments.push(AttachmentInfo {
+                color_index,
+                clear_value: info.clear_value,
             })
-            .collect();
+        }
 
         self.pass_cache = Some(RenderPassCache {
             render_pass: render_pass.clone(),
-            framebuffer: framebuffer.clone(),
-            attachment_clears,
+            attachments,
+        });
+
+        //Note: we currently only expect one sub-pass.
+
+        self.data.push_cmd(Command::BindFramebuffer {
+            target: glow::DRAW_FRAMEBUFFER,
+            framebuffer: framebuffer.raw,
+            colors,
+            depth_stencil,
         });
 
         // Enter first subpass
@@ -885,8 +882,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         value: command::ClearValue,
         _subresource_ranges: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<image::SubresourceRange>,
+        T: Iterator<Item = image::SubresourceRange>,
     {
         // TODO: clearing strategies
         //  1.  < GL 3.0 / GL ES 3.0: glClear
@@ -925,26 +921,16 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
                         }
                     }
                 };
+                self.data.push_cmd(Command::BindFramebuffer {
+                    target: glow::DRAW_FRAMEBUFFER,
+                    framebuffer: fbo,
+                    colors: iter::once(view).collect(),
+                    depth_stencil: None,
+                });
                 self.data
-                    .push_cmd(Command::BindFrameBuffer(glow::DRAW_FRAMEBUFFER, Some(fbo)));
-                self.data.push_cmd(Command::BindTargetView(
-                    glow::DRAW_FRAMEBUFFER,
-                    glow::COLOR_ATTACHMENT0,
-                    view,
-                ));
-                self.data.push_cmd(Command::SetDrawColorBuffers(1));
-
-                // Temporarily reset color mask if it was not ColorMask::ALL
-                let blend_target = self.cache.blend_targets.get(0);
-                let color_mask = blend_target
-                    .map(Option::as_ref)
-                    .flatten()
-                    .map(|blend_target| blend_target.mask)
-                    .filter(|mask| *mask != pso::ColorMask::ALL);
-                if color_mask.is_some() || blend_target.is_none() {
-                    self.data
-                        .push_cmd(Command::SetColorMask(Some(0), pso::ColorMask::ALL));
-                }
+                    .push_cmd(Command::SetDrawColorBuffers(iter::once(0).collect()));
+                self.data
+                    .push_cmd(Command::SetColorMask(None, pso::ColorMask::ALL));
 
                 self.data.push_cmd(match image.channel {
                     ChannelType::Unorm
@@ -958,9 +944,8 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
                     ChannelType::Sint => Command::ClearBufferColorI(0, color.sint32),
                 });
 
-                if let Some(mask) = color_mask {
-                    self.data.push_cmd(Command::SetColorMask(Some(0), mask));
-                }
+                //Note: color mask is not restored: we are outside of a render pass,
+                // and whatever needs to have the mask, including the pass, should set it.
             }
             None => {
                 // 1. glClear
@@ -977,10 +962,8 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
 
     unsafe fn clear_attachments<T, U>(&mut self, _: T, _: U)
     where
-        T: IntoIterator,
-        T::Item: Borrow<command::AttachmentClear>,
-        U: IntoIterator,
-        U::Item: Borrow<pso::ClearRect>,
+        T: Iterator<Item = command::AttachmentClear>,
+        U: Iterator<Item = pso::ClearRect>,
     {
         unimplemented!()
     }
@@ -993,8 +976,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _dst_layout: image::Layout,
         _regions: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::ImageResolve>,
+        T: Iterator<Item = command::ImageResolve>,
     {
         unimplemented!()
     }
@@ -1008,10 +990,9 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _filter: image::Filter,
         _regions: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::ImageBlit>,
+        T: Iterator<Item = command::ImageBlit>,
     {
-        unimplemented!()
+        error!("Blit is not implemented");
     }
 
     unsafe fn bind_index_buffer(
@@ -1026,18 +1007,17 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         self.data.push_cmd(Command::BindIndexBuffer(raw_buffer));
     }
 
-    unsafe fn bind_vertex_buffers<I, T>(&mut self, first_binding: pso::BufferIndex, buffers: I)
+    unsafe fn bind_vertex_buffers<'a, T>(&mut self, first_binding: pso::BufferIndex, buffers: T)
     where
-        I: IntoIterator<Item = (T, buffer::SubRange)>,
-        T: Borrow<n::Buffer>,
+        T: Iterator<Item = (&'a n::Buffer, buffer::SubRange)>,
     {
-        for (i, (buffer, sub)) in buffers.into_iter().enumerate() {
+        for (i, (buffer, sub)) in buffers.enumerate() {
             let index = first_binding as usize + i;
             if self.cache.vertex_buffers.len() <= index {
                 self.cache.vertex_buffers.resize(index + 1, None);
             }
 
-            let (raw_buffer, range) = buffer.borrow().as_bound();
+            let (raw_buffer, range) = buffer.as_bound();
             self.cache.vertex_buffers[index] =
                 Some((raw_buffer, crate::resolve_sub_range(&sub, range)));
         }
@@ -1045,8 +1025,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
 
     unsafe fn set_viewports<T>(&mut self, first_viewport: u32, viewports: T)
     where
-        T: IntoIterator,
-        T::Item: Borrow<pso::Viewport>,
+        T: Iterator<Item = pso::Viewport>,
     {
         // OpenGL has two functions for setting the viewports.
         // Configuring the rectangle area and setting the depth bounds are separated.
@@ -1058,7 +1037,6 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
 
         let mut len = 0;
         for viewport in viewports {
-            let viewport = viewport.borrow();
             let viewport_rect = &[
                 viewport.rect.x as f32,
                 viewport.rect.y as f32,
@@ -1092,13 +1070,11 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
 
     unsafe fn set_scissors<T>(&mut self, first_scissor: u32, scissors: T)
     where
-        T: IntoIterator,
-        T::Item: Borrow<pso::Rect>,
+        T: Iterator<Item = pso::Rect>,
     {
         let mut scissors_ptr = BufferSlice { offset: 0, size: 0 };
         let mut len = 0;
         for scissor in scissors {
-            let scissor = scissor.borrow();
             let scissor = &[
                 scissor.x as i32,
                 scissor.y as i32,
@@ -1213,10 +1189,10 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         self.cache.depth_mask = pipeline.depth.map(|d| d.write);
 
         if let Some(ref vp) = pipeline.baked_states.viewport {
-            self.set_viewports(0, iter::once(vp));
+            self.set_viewports(0, iter::once(vp.clone()));
         }
         if let Some(ref rect) = pipeline.baked_states.scissor {
-            self.set_scissors(0, iter::once(rect));
+            self.set_scissors(0, iter::once(rect.clone()));
         }
         if let Some(color) = pipeline.baked_states.blend_color {
             self.set_blend_constants(color);
@@ -1243,17 +1219,15 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    unsafe fn bind_graphics_descriptor_sets<I, J>(
+    unsafe fn bind_graphics_descriptor_sets<'a, I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
         sets: I,
         offsets: J,
     ) where
-        I: IntoIterator,
-        I::Item: Borrow<n::DescriptorSet>,
-        J: IntoIterator,
-        J::Item: Borrow<command::DescriptorSetOffset>,
+        I: Iterator<Item = &'a n::DescriptorSet>,
+        J: Iterator<Item = command::DescriptorSetOffset>,
     {
         self.bind_descriptor_sets(layout, first_set, sets, offsets)
     }
@@ -1265,17 +1239,15 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         }
     }
 
-    unsafe fn bind_compute_descriptor_sets<I, J>(
+    unsafe fn bind_compute_descriptor_sets<'a, I, J>(
         &mut self,
         layout: &n::PipelineLayout,
         first_set: usize,
         sets: I,
         offsets: J,
     ) where
-        I: IntoIterator,
-        I::Item: Borrow<n::DescriptorSet>,
-        J: IntoIterator,
-        J::Item: Borrow<command::DescriptorSetOffset>,
+        I: Iterator<Item = &'a n::DescriptorSet>,
+        J: Iterator<Item = command::DescriptorSetOffset>,
     {
         self.bind_descriptor_sets(layout, first_set, sets, offsets)
     }
@@ -1285,22 +1257,20 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
     }
 
     unsafe fn dispatch_indirect(&mut self, buffer: &n::Buffer, offset: buffer::Offset) {
-        let (raw_buffer, range) = buffer.borrow().as_bound();
+        let (raw_buffer, range) = buffer.as_bound();
         self.data
             .push_cmd(Command::DispatchIndirect(raw_buffer, range.start + offset));
     }
 
     unsafe fn copy_buffer<T>(&mut self, src: &n::Buffer, dst: &n::Buffer, regions: T)
     where
-        T: IntoIterator,
-        T::Item: Borrow<command::BufferCopy>,
+        T: Iterator<Item = command::BufferCopy>,
     {
         let old_size = self.data.buf.size;
 
         let (src_raw, src_range) = src.as_bound();
         let (dst_raw, dst_range) = dst.as_bound();
-        for region in regions {
-            let mut r = region.borrow().clone();
+        for mut r in regions {
             r.src += src_range.start;
             r.dst += dst_range.start;
             let cmd = Command::CopyBufferToBuffer(src_raw, dst_raw, r);
@@ -1320,13 +1290,11 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _dst_layout: image::Layout,
         regions: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::ImageCopy>,
+        T: Iterator<Item = command::ImageCopy>,
     {
         let old_size = self.data.buf.size;
 
-        for region in regions {
-            let r = region.borrow().clone();
+        for r in regions {
             let cmd = match dst.object_type {
                 n::ImageType::Renderbuffer { raw, format } => Command::CopyImageToRenderbuffer {
                     src_image: src.object_type,
@@ -1353,14 +1321,12 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _: image::Layout,
         regions: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::BufferImageCopy>,
+        T: Iterator<Item = command::BufferImageCopy>,
     {
         let old_size = self.data.buf.size;
 
         let (src_raw, src_range) = src.as_bound();
-        for region in regions {
-            let mut r = region.borrow().clone();
+        for mut r in regions {
             r.buffer_offset += src_range.start;
             let cmd = match dst.object_type {
                 n::ImageType::Renderbuffer { raw, .. } => {
@@ -1396,14 +1362,12 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         dst: &n::Buffer,
         regions: T,
     ) where
-        T: IntoIterator,
-        T::Item: Borrow<command::BufferImageCopy>,
+        T: Iterator<Item = command::BufferImageCopy>,
     {
         let old_size = self.data.buf.size;
         let (dst_raw, dst_range) = dst.as_bound();
 
-        for region in regions {
-            let mut r = region.borrow().clone();
+        for mut r in regions {
             r.buffer_offset += dst_range.start;
             let cmd = match src.object_type {
                 n::ImageType::Renderbuffer { raw, .. } => {
@@ -1523,7 +1487,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _buffer: &n::Buffer,
         _offset: buffer::Offset,
         _draw_count: hal::DrawCount,
-        _stride: u32,
+        _stride: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1533,7 +1497,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _buffer: &n::Buffer,
         _offset: buffer::Offset,
         _draw_count: hal::DrawCount,
-        _stride: u32,
+        _stride: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1545,7 +1509,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _count_buffer: &n::Buffer,
         _count_buffer_offset: buffer::Offset,
         _max_draw_count: u32,
-        _stride: u32,
+        _stride: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1557,7 +1521,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _count_buffer: &n::Buffer,
         _count_buffer_offset: buffer::Offset,
         _max_draw_count: u32,
-        _stride: u32,
+        _stride: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1571,7 +1535,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _: &n::Buffer,
         _: buffer::Offset,
         _: hal::DrawCount,
-        _: u32,
+        _: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1583,7 +1547,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _: &n::Buffer,
         _: buffer::Offset,
         _: u32,
-        _: u32,
+        _: buffer::Stride,
     ) {
         unimplemented!()
     }
@@ -1597,10 +1561,8 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
 
     unsafe fn wait_events<'a, I, J>(&mut self, _: I, _: Range<pso::PipelineStage>, _: J)
     where
-        I: IntoIterator,
-        I::Item: Borrow<()>,
-        J: IntoIterator,
-        J::Item: Borrow<memory::Barrier<'a, Backend>>,
+        I: Iterator<Item = &'a ()>,
+        J: Iterator<Item = memory::Barrier<'a, Backend>>,
     {
         unimplemented!()
     }
@@ -1615,7 +1577,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         _queries: Range<query::Id>,
         _buffer: &n::Buffer,
         _offset: buffer::Offset,
-        _stride: buffer::Offset,
+        _stride: buffer::Stride,
         _flags: query::ResultFlags,
     ) {
         unimplemented!()
@@ -1671,10 +1633,9 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         unimplemented!()
     }
 
-    unsafe fn execute_commands<'a, T, I>(&mut self, _buffers: I)
+    unsafe fn execute_commands<'a, T>(&mut self, _buffers: T)
     where
-        T: 'a + Borrow<CommandBuffer>,
-        I: IntoIterator<Item = &'a T>,
+        T: Iterator<Item = &'a CommandBuffer>,
     {
         unimplemented!()
     }

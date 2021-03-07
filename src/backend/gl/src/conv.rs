@@ -219,7 +219,7 @@ pub fn describe_format(format: Format) -> Option<FormatDescription> {
         S8Uint => FormatDescription::new(glow::R8, glow::RED, glow::UNSIGNED_BYTE, 1, Integer),
         D16Unorm => FormatDescription::new(
             glow::DEPTH_COMPONENT16,
-            glow::DEPTH,
+            glow::DEPTH_COMPONENT,
             glow::UNSIGNED_NORMALIZED,
             1,
             Float,
@@ -231,9 +231,13 @@ pub fn describe_format(format: Format) -> Option<FormatDescription> {
             2,
             Float,
         ),
-        D32Sfloat => {
-            FormatDescription::new(glow::DEPTH_COMPONENT32F, glow::DEPTH, glow::FLOAT, 1, Float)
-        }
+        D32Sfloat => FormatDescription::new(
+            glow::DEPTH_COMPONENT32F,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+            1,
+            Float,
+        ),
         D32SfloatS8Uint => FormatDescription::new(
             glow::DEPTH32F_STENCIL8,
             glow::DEPTH_STENCIL,
@@ -251,4 +255,14 @@ pub fn describe_format(format: Format) -> Option<FormatDescription> {
 
         _ => return None,
     })
+}
+
+#[cfg(feature = "cross")]
+pub fn map_naga_stage_to_cross(stage: naga::ShaderStage) -> spirv_cross::spirv::ExecutionModel {
+    use spirv_cross::spirv::ExecutionModel as Em;
+    match stage {
+        naga::ShaderStage::Vertex => Em::Vertex,
+        naga::ShaderStage::Fragment => Em::Fragment,
+        naga::ShaderStage::Compute => Em::GlCompute,
+    }
 }
